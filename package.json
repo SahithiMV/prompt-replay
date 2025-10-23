@@ -1,0 +1,40 @@
+{
+  "name": "prompt-replay",
+  "displayName": "Prompt Replay",
+  "description": "Trace AI prompts to the diffs they caused. Rewind, understand, and replay AI-assisted edits.",
+  "version": "0.1.0",
+  "publisher": "Sahithi Maddula",
+  "main": "./out/extension.js",
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "activationEvents": [
+    "onStartupFinished",
+    "onCommand:promptReplay.startSession",
+    "onCommand:promptReplay.createCheckpoint",
+    "onCommand:promptReplay.logPrompt",
+    "onCommand:promptReplay.openTimeline"
+  ],
+  "contributes": {
+    "commands": [
+      { "command": "promptReplay.startSession", "title": "Prompt Replay: Start Session" },
+      { "command": "promptReplay.createCheckpoint", "title": "Prompt Replay: Create Checkpoint (pre-change)" },
+      { "command": "promptReplay.logPrompt", "title": "Prompt Replay: Log Prompt…" },
+      { "command": "promptReplay.openTimeline", "title": "Prompt Replay: Open Timeline" }
+    ]
+  },
+  "scripts": {
+    "compile": "tsc -p .",
+    "watch": "tsc -w -p .",
+    "vscode:prepublish": "npm run compile"
+  },
+  "devDependencies": {
+    "@types/node": "^20.12.12",
+    "@types/vscode": "^1.105.0",
+    "esbuild": "^0.23.0",
+    "typescript": "^5.9.3"
+  }
+}
