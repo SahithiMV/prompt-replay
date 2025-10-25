@@ -28,12 +28,15 @@ class TimelinePanel {
         return (s ?? '').toString().replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
     }
     renderHtml(events) {
-        const rows = (events ?? []).slice().reverse().map(ev => {
-            const date = new Date(ev.timestamp || Date.now()).toLocaleString();
+        const rows = (events ?? []).map(ev => {
+            const ts = Number(ev.timestamp ?? Date.now());
+            const id = String(ev.id ?? `${ts}-${Math.random().toString(36).slice(2)}`);
+            const date = new Date(ts).toLocaleString();
             const files = ev.filesChanged?.length ?? 0;
             const promptTxt = String(ev.prompt ?? '');
             const promptShort = promptTxt.length > 200 ? promptTxt.slice(0, 197) + '…' : promptTxt;
             const tags = (ev.tags ?? []).map(t => `<span class="tag">${this.esc(String(t))}</span>`).join(' ');
+            const responsePreviewStr = ev.responsePreview ? String(ev.responsePreview) : '';
             const fileRows = (ev.diffUris ?? []).map(d => {
                 const left = d.left ?? '';
                 const right = d.right ?? '';
@@ -42,6 +45,8 @@ class TimelinePanel {
             <td class="path">${this.esc(String(d.path ?? ''))}</td>
             <td class="actions">
               <button
+                class="btn"
+                data-cmd="openDiff"
                 data-left="${encodeURIComponent(left)}"
                 data-right="${encodeURIComponent(right)}"
                 data-title="${encodeURIComponent('Prompt Replay • ' + (d.path ?? ''))}">
@@ -50,18 +55,25 @@ class TimelinePanel {
             </td>
           </tr>`;
             }).join('');
-            const responsePreview = ev.responsePreview
-                ? `<div class="muted">↳ ${this.esc(String(ev.responsePreview))}</div>`
-                : '';
             return `
-        <div class="event">
+        <div class="event" data-id="${this.esc(id)}" data-ts="${ts}">
           <div class="hdr">
+            <button class="toggle" title="Collapse/Expand" data-cmd="toggle">▾</button>
             <span class="time">🕒 ${this.esc(date)}</span>
             <span class="files">📄 ${files} file${files === 1 ? '' : 's'}</span>
+            <span class="spacer"></span>
+            <button class="btn danger" data-cmd="restoreEvent" data-side="after" data-id="${this.esc(id)}" title="Restore workspace to this prompt's AFTER state">
+              Restore After
+            </button>
+            <button class="btn" data-cmd="restoreEvent" data-side="before" data-id="${this.esc(id)}" title="Restore workspace to this prompt's BEFORE (checkpoint) state">
+              Restore Before
+            </button>
           </div>
           <div class="prompt">“${this.esc(promptShort)}” ${tags}</div>
-          ${responsePreview}
-          <table class="files"><tbody>${fileRows}</tbody></table>
+          <div class="body">
+            ${responsePreviewStr ? `<div class="muted">↳ ${this.esc(responsePreviewStr)}</div>` : ''}
+            <table class="files"><tbody>${fileRows}</tbody></table>
+          </div>
         </div>`;
         }).join('');
         return `<!doctype html>
@@ -70,55 +82,163 @@ class TimelinePanel {
   <meta charset="UTF-8" />
   <style>
     body { font-family: var(--vscode-font-family); color: var(--vscode-editor-foreground); padding: 10px; }
-    .toolbar { display:flex; gap:8px; margin-bottom:10px; }
+    .toolbar { display:flex; gap:8px; margin-bottom:10px; align-items:center; }
     input[type="text"] { flex:1; padding:6px; }
     button { cursor:pointer; }
+    #grid { display:block; }
     .event { border: 1px solid var(--vscode-panel-border); border-radius: 8px; padding: 10px; margin-bottom: 10px; }
-    .hdr { display: flex; gap: 12px; font-size: 12px; opacity: 0.85; margin-bottom: 6px; }
+    .hdr { display: flex; gap: 12px; font-size: 12px; opacity: 0.9; margin-bottom: 6px; align-items:center; }
+    .spacer { flex:1; }
+    .toggle { border: 1px solid var(--vscode-panel-border); background: var(--vscode-button-secondaryBackground);
+              color: var(--vscode-button-secondaryForeground); border-radius: 6px; padding: 2px 8px; }
     .prompt { margin: 6px 0 8px; font-weight: 600; }
+    .body.hidden { display: none; }
     table.files { width: 100%; border-collapse: collapse; }
     td.path { padding: 6px 4px; font-family: var(--vscode-editor-font-family); font-size: 12px; }
     td.actions { text-align: right; padding: 6px 4px; }
     .tag { display:inline-block; margin-left:6px; padding:1px 6px; border-radius:10px; border:1px solid var(--vscode-panel-border); font-size:11px; opacity:.8; }
     .muted { opacity:.7; }
+    .btn { background: var(--vscode-button-secondaryBackground); color: var(--vscode-button-secondaryForeground);
+           border: 1px solid var(--vscode-panel-border); border-radius: 6px; padding: 4px 8px; }
+    .btn.danger { background: var(--vscode-inputValidation-errorBackground);
+                  color: var(--vscode-errorForeground);
+                  border-color: var(--vscode-inputValidation-errorBorder); }
   </style>
 </head>
 <body>
   <div class="toolbar">
     <input id="search" placeholder="Search prompts/files/tags… (Enter or click Search)" />
     <button id="run">Search</button>
+    <button id="sort">Sort: Newest</button>
+    <button id="collapseAll" title="Collapse all">Collapse all</button>
+    <button id="expandAll" title="Expand all">Expand all</button>
   </div>
 
-  ${rows || '<p class="muted">No events yet. Use “Prompt Replay: Create Checkpoint”, then “Log Prompt…”.</p>'}
+  <div id="grid">
+    ${rows || '<p class="muted">No events yet. Use “Prompt Replay: Create Checkpoint”, then “Log Prompt…”.</p>'}
+  </div>
 
   <script>
     const vscode = acquireVsCodeApi();
 
-    // Persist search text across renders
-    const st = vscode.getState() || { q: '' };
+    // persistent UI state
+    const st = Object.assign({ q: '', sort: 'newest', collapsedIds: {} }, vscode.getState() || {});
+
     const search = document.getElementById('search');
+    const btnRun = document.getElementById('run');
+    const btnSort = document.getElementById('sort');
+    const btnCollapseAll = document.getElementById('collapseAll');
+    const btnExpandAll = document.getElementById('expandAll');
+    const grid = document.getElementById('grid');
+
     search.value = st.q || '';
+    btnSort.textContent = 'Sort: ' + (st.sort === 'oldest' ? 'Oldest' : 'Newest');
+
+    // apply initial collapsed state
+    for (const ev of grid.querySelectorAll('.event')) {
+      const id = ev.getAttribute('data-id');
+      const body = ev.querySelector('.body');
+      const toggleBtn = ev.querySelector('.toggle');
+      if (st.collapsedIds[id]) {
+        body?.classList.add('hidden');
+        if (toggleBtn) toggleBtn.textContent = '▸';
+      } else {
+        if (toggleBtn) toggleBtn.textContent = '▾';
+      }
+    }
+
+    function setCollapsed(evEl, collapsed) {
+      const id = evEl.getAttribute('data-id');
+      const body = evEl.querySelector('.body');
+      const toggleBtn = evEl.querySelector('.toggle');
+      if (collapsed) {
+        body?.classList.add('hidden');
+        if (toggleBtn) toggleBtn.textContent = '▸';
+        st.collapsedIds[id] = true;
+      } else {
+        body?.classList.remove('hidden');
+        if (toggleBtn) toggleBtn.textContent = '▾';
+        delete st.collapsedIds[id];
+      }
+      vscode.setState(st);
+    }
+
+    function applySort() {
+      const cards = Array.from(grid.querySelectorAll('.event'));
+      cards.sort((a, b) => {
+        const ta = Number(a.getAttribute('data-ts') || '0');
+        const tb = Number(b.getAttribute('data-ts') || '0');
+        return st.sort === 'newest' ? (tb - ta) : (ta - tb);
+      });
+      grid.innerHTML = '';
+      for (const c of cards) grid.appendChild(c);
+      btnSort.textContent = 'Sort: ' + (st.sort === 'oldest' ? 'Oldest' : 'Newest');
+      vscode.setState(st);
+
+      // reapply collapsed arrows (DOM rebuilt)
+      for (const ev of grid.querySelectorAll('.event')) {
+        const id = ev.getAttribute('data-id');
+        const body = ev.querySelector('.body');
+        const toggleBtn = ev.querySelector('.toggle');
+        if (st.collapsedIds[id]) {
+          body?.classList.add('hidden');
+          if (toggleBtn) toggleBtn.textContent = '▸';
+        } else {
+          if (toggleBtn) toggleBtn.textContent = '▾';
+        }
+      }
+    }
 
     function runSearch() {
       const q = search.value;
-      vscode.setState({ q });          // keep phrase (with spaces)
-      vscode.postMessage({ type: 'search', q }); // ask extension to filter + re-render
+      vscode.setState(Object.assign(st, { q }));
+      vscode.postMessage({ type: 'search', q });
     }
 
-    document.getElementById('run').addEventListener('click', runSearch);
-    search.addEventListener('keydown', (e) => {
-      if (e.key === 'Enter') runSearch();
+    // toolbar handlers
+    btnRun.addEventListener('click', runSearch);
+    search.addEventListener('keydown', (e) => { if (e.key === 'Enter') runSearch(); });
+    btnSort.addEventListener('click', () => { st.sort = (st.sort === 'newest' ? 'oldest' : 'newest'); applySort(); });
+    btnCollapseAll.addEventListener('click', () => {
+      for (const ev of grid.querySelectorAll('.event')) setCollapsed(ev, true);
+    });
+    btnExpandAll.addEventListener('click', () => {
+      for (const ev of grid.querySelectorAll('.event')) setCollapsed(ev, false);
     });
 
-    // Open diffs
+    // body click: per-event toggle + restore + openDiff
     document.body.addEventListener('click', (e) => {
       const btn = e.target.closest('button');
-      if (!btn || btn.id === 'run') return;
-      const left = decodeURIComponent(btn.dataset.left || '');
-      const right = decodeURIComponent(btn.dataset.right || '');
-      const title = decodeURIComponent(btn.dataset.title || 'Diff');
-      vscode.postMessage({ type: 'openDiff', left, right, title });
+      if (!btn) return;
+
+      const cmd = btn.getAttribute('data-cmd');
+      if (btn.id === 'run' || btn.id === 'sort' || btn.id === 'collapseAll' || btn.id === 'expandAll') return;
+
+      if (cmd === 'toggle') {
+        const evEl = btn.closest('.event');
+        const currentlyCollapsed = evEl.querySelector('.body')?.classList.contains('hidden');
+        setCollapsed(evEl, !currentlyCollapsed);
+        return;
+      }
+
+      if (cmd === 'restoreEvent') {
+        const id = btn.getAttribute('data-id');
+        const side = btn.getAttribute('data-side') || 'after';
+        vscode.postMessage({ type: 'restoreEvent', id, side });
+        return;
+      }
+
+      if (cmd === 'openDiff') {
+        const left = decodeURIComponent(btn.dataset.left || '');
+        const right = decodeURIComponent(btn.dataset.right || '');
+        const title = decodeURIComponent(btn.dataset.title || 'Diff');
+        vscode.postMessage({ type: 'openDiff', left, right, title });
+        return;
+      }
     });
+
+    // initial sort
+    applySort();
   </script>
 </body>
 </html>`;

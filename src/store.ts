@@ -77,4 +77,6 @@ export class Store {
   set session(s: SessionState) {
     this.ctx.globalState.update('promptReplay.session', s);
   }
+
+  
 }
