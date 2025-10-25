@@ -40,18 +40,27 @@ class TimelinePanel {
             const fileRows = (ev.diffUris ?? []).map(d => {
                 const left = d.left ?? '';
                 const right = d.right ?? '';
+                const rel = String(d.path ?? '');
                 return `
           <tr>
-            <td class="path">${this.esc(String(d.path ?? ''))}</td>
+            <td class="path">${this.esc(rel)}</td>
             <td class="actions">
-              <button
-                class="btn"
-                data-cmd="openDiff"
-                data-left="${encodeURIComponent(left)}"
-                data-right="${encodeURIComponent(right)}"
-                data-title="${encodeURIComponent('Prompt Replay • ' + (d.path ?? ''))}">
-                View Diff
-              </button>
+              <div class="row-actions">
+                <button
+                  class="btn"
+                  data-cmd="openDiff"
+                  data-left="${encodeURIComponent(left)}"
+                  data-right="${encodeURIComponent(right)}"
+                  data-title="${encodeURIComponent('Prompt Replay • ' + rel)}">
+                  View Diff
+                </button>
+                <button class="btn small" data-cmd="restoreFile" data-side="after" data-id="${this.esc(id)}" data-path="${this.esc(rel)}" title="Restore this file to state at log time">
+                  Restore file (After)
+                </button>
+                <button class="btn small" data-cmd="restoreFile" data-side="before" data-id="${this.esc(id)}" data-path="${this.esc(rel)}" title="Restore this file to checkpoint state">
+                  Restore file (Before)
+                </button>
+              </div>
             </td>
           </tr>`;
             }).join('');
@@ -103,6 +112,8 @@ class TimelinePanel {
     .btn.danger { background: var(--vscode-inputValidation-errorBackground);
                   color: var(--vscode-errorForeground);
                   border-color: var(--vscode-inputValidation-errorBorder); }
+    .row-actions { display: inline-flex; gap: 6px; align-items: center; }
+    .btn.small { padding: 2px 6px; font-size: 11px; }
   </style>
 </head>
 <body>
@@ -206,7 +217,7 @@ class TimelinePanel {
       for (const ev of grid.querySelectorAll('.event')) setCollapsed(ev, false);
     });
 
-    // body click: per-event toggle + restore + openDiff
+    // body click: per-event toggle + restore + openDiff + per-file restore
     document.body.addEventListener('click', (e) => {
       const btn = e.target.closest('button');
       if (!btn) return;
@@ -225,6 +236,14 @@ class TimelinePanel {
         const id = btn.getAttribute('data-id');
         const side = btn.getAttribute('data-side') || 'after';
         vscode.postMessage({ type: 'restoreEvent', id, side });
+        return;
+      }
+
+      if (cmd === 'restoreFile') {
+        const id = btn.getAttribute('data-id');
+        const side = btn.getAttribute('data-side') || 'after';
+        const path = btn.getAttribute('data-path');
+        vscode.postMessage({ type: 'restoreFile', id, side, path });
         return;
       }
 

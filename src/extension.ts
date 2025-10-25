@@ -14,10 +14,12 @@ const touchedSinceCheckpoint = new Set<string>();
 function relPath(uri: vscode.Uri): string {
   return vscode.workspace.asRelativePath(uri).replace(/\\/g, '/');
 }
-
 async function exists(uri: vscode.Uri | undefined): Promise<boolean> {
   if (!uri) return false;
   try { await vscode.workspace.fs.stat(uri); return true; } catch { return false; }
+}
+async function statMaybe(uri: vscode.Uri): Promise<vscode.FileStat | undefined> {
+  try { return await vscode.workspace.fs.stat(uri); } catch { return undefined; }
 }
 
 export async function activate(context: vscode.ExtensionContext) {
@@ -213,152 +215,12 @@ export async function activate(context: vscode.ExtensionContext) {
         }
 
         if (message.type === 'restoreEvent') {
-          const id = String(message.id || '');
-          const side: 'after' | 'before' = (message.side === 'before' ? 'before' : 'after'); // default AFTER
-          if (!id) { vscode.window.showWarningMessage('Missing event id.'); return; }
+          await handleRestoreEvent(message, store);
+          return;
+        }
 
-          // find the event
-          const all = await store.readEvents();
-          const ev = all.find(e => e.id === id);
-          if (!ev) { vscode.window.showWarningMessage('Event not found.'); return; }
-
-          const prettySide = side === 'after' ? 'AFTER (state at log time)' : 'BEFORE (state at checkpoint)';
-          const confirm = await vscode.window.showWarningMessage(
-            `Restore ${ev.filesChanged.length} file(s) to ${prettySide}? This will overwrite your working copies.`,
-            { modal: true },
-            'Restore'
-          );
-          if (confirm !== 'Restore') return;
-
-          const root = ev.repoRoot || vscode.workspace.workspaceFolders?.[0]?.uri.fsPath || '';
-          if (!root) { vscode.window.showWarningMessage('Workspace root not found.'); return; }
-
-          // --- Pre-restore backup so we can Undo ---
-          const backupId = `backup-${Date.now()}`;
-          const backupDir = vscode.Uri.file(path.join(root, '.promptreplay', 'restore_backups', backupId));
-          const backupBeforeDir = vscode.Uri.file(path.join(backupDir.fsPath, 'before'));
-          try { await vscode.workspace.fs.createDirectory(backupBeforeDir); } catch {}
-
-          type BackupEntry = { path: string; existed: boolean; };
-          const manifest: BackupEntry[] = [];
-
-          // Record and copy current file state for all target files
-          for (const d of ev.diffUris || []) {
-            const rel = d.path;
-            const target = vscode.Uri.file(path.join(root, rel));
-            const entry: BackupEntry = { path: rel, existed: false };
-            try {
-              let stat: vscode.FileStat | undefined;
-                try {
-                  stat = await vscode.workspace.fs.stat(target);
-                } catch {
-                  stat = undefined;
-                }
-              if (stat) {
-                entry.existed = true;
-                const backupTarget = vscode.Uri.file(path.join(backupBeforeDir.fsPath, rel));
-                try { await vscode.workspace.fs.createDirectory(vscode.Uri.file(path.dirname(backupTarget.fsPath))); } catch {}
-                const buf = await vscode.workspace.fs.readFile(target);
-                await vscode.workspace.fs.writeFile(backupTarget, buf);
-              }
-            } catch {
-              // ignore, leave existed=false
-            }
-            manifest.push(entry);
-          }
-
-          // Save manifest
-          const manifestUri = vscode.Uri.file(path.join(backupDir.fsPath, 'manifest.json'));
-          await vscode.workspace.fs.writeFile(manifestUri, Buffer.from(JSON.stringify(manifest, null, 2), 'utf8'));
-
-          // --- Apply snapshot from the chosen side ---
-          let restored = 0, deleted = 0, skipped = 0, errors = 0;
-
-          for (const d of ev.diffUris || []) {
-            const rel = d.path;
-            const target = vscode.Uri.file(path.join(root, rel));
-
-            try {
-              const leftStr = d.left || '';
-              const rightStr = d.right || '';
-              const leftUri  = leftStr  ? vscode.Uri.parse(leftStr)  : undefined;
-              const rightUri = rightStr ? vscode.Uri.parse(rightStr) : undefined;
-              const op = (d as any).op as string | undefined;
-
-              // choose which snapshot to apply
-              // AFTER: write right (except when op=deleted => delete)
-              // BEFORE: write left (except when op=added   => delete)
-              let snapshotToWrite: vscode.Uri | undefined;
-              let shouldDelete = false;
-
-              if (side === 'after') {
-                shouldDelete = (op === 'deleted');
-                snapshotToWrite = shouldDelete ? undefined : rightUri;
-              } else { // 'before'
-                shouldDelete = (op === 'added');
-                snapshotToWrite = shouldDelete ? undefined : leftUri;
-              }
-
-              // Ensure we are using our on-disk snapshots
-              const expectedBase = path.join(root, '.promptreplay', 'snapshots', id);
-              if (!shouldDelete && (!snapshotToWrite || snapshotToWrite.scheme !== 'file' || !snapshotToWrite.fsPath.startsWith(expectedBase))) {
-                skipped++;
-                continue;
-              }
-
-              if (shouldDelete) {
-                try {
-                  await vscode.workspace.fs.delete(target, { recursive: false, useTrash: false });
-                  deleted++;
-                } catch {
-                  skipped++;
-                }
-              } else {
-                const buf = await vscode.workspace.fs.readFile(snapshotToWrite!);
-                try { await vscode.workspace.fs.createDirectory(vscode.Uri.file(path.dirname(target.fsPath))); } catch {}
-                await vscode.workspace.fs.writeFile(target, buf);
-                restored++;
-              }
-            } catch {
-              errors++;
-            }
-          }
-
-          // Offer Undo right away
-          const undoAction = 'Undo';
-          const summary = `Prompt Replay: restore (${side.toUpperCase()}) — ${restored} restored, ${deleted} deleted, ${skipped} skipped${errors ? `, ${errors} errors` : ''}.`;
-          const choice = await vscode.window.showInformationMessage(summary, undoAction);
-
-          // lightweight, inline undo
-          if (choice === undoAction) {
-            let uRestored = 0, uDeleted = 0, uErrors = 0;
-            try {
-              const raw = await vscode.workspace.fs.readFile(manifestUri);
-              const manifestParsed = JSON.parse(Buffer.from(raw).toString('utf8')) as BackupEntry[];
-              for (const entry of manifestParsed) {
-                const rel = entry.path;
-                const target = vscode.Uri.file(path.join(root, rel));
-                const backupFile = vscode.Uri.file(path.join(backupBeforeDir.fsPath, rel));
-                try {
-                  if (entry.existed) {
-                    const buf = await vscode.workspace.fs.readFile(backupFile);
-                    try { await vscode.workspace.fs.createDirectory(vscode.Uri.file(path.dirname(target.fsPath))); } catch {}
-                    await vscode.workspace.fs.writeFile(target, buf);
-                    uRestored++;
-                  } else {
-                    await vscode.workspace.fs.delete(target, { recursive: false, useTrash: false });
-                    uDeleted++;
-                  }
-                } catch {
-                  uErrors++;
-                }
-              }
-              vscode.window.showInformationMessage(`Prompt Replay: undo complete — ${uRestored} restored, ${uDeleted} deleted${uErrors ? `, ${uErrors} errors` : ''}.`);
-            } catch {
-              vscode.window.showErrorMessage('Prompt Replay: undo failed (could not read backup).');
-            }
-          }
-
+        if (message.type === 'restoreFile') {
+          await handleRestoreFile(message, store);
           return;
         }
       } catch (e) {
@@ -386,3 +248,241 @@ export async function activate(context: vscode.ExtensionContext) {
 }
 
 export function deactivate() {}
+
+/* ---------------- helpers for restore actions ---------------- */
+
+async function handleRestoreEvent(message: any, store: Store) {
+  const id = String(message.id || '');
+  const side: 'after' | 'before' = (message.side === 'before' ? 'before' : 'after'); // default AFTER
+  if (!id) { vscode.window.showWarningMessage('Missing event id.'); return; }
+
+  const all = await store.readEvents();
+  const ev = all.find(e => e.id === id);
+  if (!ev) { vscode.window.showWarningMessage('Event not found.'); return; }
+
+  const prettySide = side === 'after' ? 'AFTER (state at log time)' : 'BEFORE (state at checkpoint)';
+  const confirm = await vscode.window.showWarningMessage(
+    `Restore ${ev.filesChanged.length} file(s) to ${prettySide}? This will overwrite your working copies.`,
+    { modal: true },
+    'Restore'
+  );
+  if (confirm !== 'Restore') return;
+
+  const root = ev.repoRoot || vscode.workspace.workspaceFolders?.[0]?.uri.fsPath || '';
+  if (!root) { vscode.window.showWarningMessage('Workspace root not found.'); return; }
+
+  // --- Pre-restore backup so we can Undo ---
+  const backupId = `backup-${Date.now()}`;
+  const backupDir = vscode.Uri.file(path.join(root, '.promptreplay', 'restore_backups', backupId));
+  const backupBeforeDir = vscode.Uri.file(path.join(backupDir.fsPath, 'before'));
+  try { await vscode.workspace.fs.createDirectory(backupBeforeDir); } catch {}
+
+  type BackupEntry = { path: string; existed: boolean; };
+  const manifest: BackupEntry[] = [];
+
+  // Backup all target files
+  for (const d of ev.diffUris || []) {
+    const rel = d.path;
+    const target = vscode.Uri.file(path.join(root, rel));
+    const entry: BackupEntry = { path: rel, existed: false };
+    const st = await statMaybe(target);
+    if (st) {
+      entry.existed = true;
+      const backupTarget = vscode.Uri.file(path.join(backupBeforeDir.fsPath, rel));
+      try { await vscode.workspace.fs.createDirectory(vscode.Uri.file(path.dirname(backupTarget.fsPath))); } catch {}
+      const buf = await vscode.workspace.fs.readFile(target);
+      await vscode.workspace.fs.writeFile(backupTarget, buf);
+    }
+    manifest.push(entry);
+  }
+
+  const manifestUri = vscode.Uri.file(path.join(backupDir.fsPath, 'manifest.json'));
+  await vscode.workspace.fs.writeFile(manifestUri, Buffer.from(JSON.stringify(manifest, null, 2), 'utf8'));
+
+  // --- Apply snapshot from the chosen side ---
+  let restored = 0, deleted = 0, skipped = 0, errors = 0;
+
+  for (const d of ev.diffUris || []) {
+    const rel = d.path;
+    const target = vscode.Uri.file(path.join(root, rel));
+
+    try {
+      const leftStr = d.left || '';
+      const rightStr = d.right || '';
+      const leftUri  = leftStr  ? vscode.Uri.parse(leftStr)  : undefined;
+      const rightUri = rightStr ? vscode.Uri.parse(rightStr) : undefined;
+      const op = (d as any).op as string | undefined;
+
+      let snapshotToWrite: vscode.Uri | undefined;
+      let shouldDelete = false;
+
+      if (side === 'after') {
+        shouldDelete = (op === 'deleted');
+        snapshotToWrite = shouldDelete ? undefined : rightUri;
+      } else {
+        shouldDelete = (op === 'added');
+        snapshotToWrite = shouldDelete ? undefined : leftUri;
+      }
+
+      const expectedBase = path.join(root, '.promptreplay', 'snapshots', id);
+      if (!shouldDelete && (!snapshotToWrite || snapshotToWrite.scheme !== 'file' || !snapshotToWrite.fsPath.startsWith(expectedBase))) {
+        skipped++;
+        continue;
+      }
+
+      if (shouldDelete) {
+        try { await vscode.workspace.fs.delete(target, { recursive: false, useTrash: false }); deleted++; }
+        catch { skipped++; }
+      } else {
+        const buf = await vscode.workspace.fs.readFile(snapshotToWrite!);
+        try { await vscode.workspace.fs.createDirectory(vscode.Uri.file(path.dirname(target.fsPath))); } catch {}
+        await vscode.workspace.fs.writeFile(target, buf);
+        restored++;
+      }
+    } catch {
+      errors++;
+    }
+  }
+
+  const undoAction = 'Undo';
+  const summary = `Prompt Replay: restore (${side.toUpperCase()}) — ${restored} restored, ${deleted} deleted, ${skipped} skipped${errors ? `, ${errors} errors` : ''}.`;
+  const choice = await vscode.window.showInformationMessage(summary, undoAction);
+
+  if (choice === undoAction) {
+    let uRestored = 0, uDeleted = 0, uErrors = 0;
+    try {
+      const raw = await vscode.workspace.fs.readFile(manifestUri);
+      const manifestParsed = JSON.parse(Buffer.from(raw).toString('utf8')) as BackupEntry[];
+      for (const entry of manifestParsed) {
+        const rel = entry.path;
+        const target = vscode.Uri.file(path.join(root, rel));
+        const backupFile = vscode.Uri.file(path.join(backupBeforeDir.fsPath, rel));
+        try {
+          if (entry.existed) {
+            const buf = await vscode.workspace.fs.readFile(backupFile);
+            try { await vscode.workspace.fs.createDirectory(vscode.Uri.file(path.dirname(target.fsPath))); } catch {}
+            await vscode.workspace.fs.writeFile(target, buf);
+            uRestored++;
+          } else {
+            await vscode.workspace.fs.delete(target, { recursive: false, useTrash: false });
+            uDeleted++;
+          }
+        } catch {
+          uErrors++;
+        }
+      }
+      vscode.window.showInformationMessage(`Prompt Replay: undo complete — ${uRestored} restored, ${uDeleted} deleted${uErrors ? `, ${uErrors} errors` : ''}.`);
+    } catch {
+      vscode.window.showErrorMessage('Prompt Replay: undo failed (could not read backup).');
+    }
+  }
+}
+
+async function handleRestoreFile(message: any, store: Store) {
+  const id = String(message.id || '');
+  const side: 'after' | 'before' = (message.side === 'before' ? 'before' : 'after');
+  const rel = String(message.path || '');
+  if (!id || !rel) { vscode.window.showWarningMessage('Missing event id or file path.'); return; }
+
+  const all = await store.readEvents();
+  const ev = all.find(e => e.id === id);
+  if (!ev) { vscode.window.showWarningMessage('Event not found.'); return; }
+
+  const fileEntry = (ev.diffUris || []).find(d => d.path === rel);
+  if (!fileEntry) { vscode.window.showWarningMessage('File not part of this event.'); return; }
+
+  const prettySide = side === 'after' ? 'AFTER (state at log time)' : 'BEFORE (state at checkpoint)';
+  const confirm = await vscode.window.showWarningMessage(
+    `Restore file "${rel}" to ${prettySide}? This will overwrite your working copy.`,
+    { modal: true },
+    'Restore'
+  );
+  if (confirm !== 'Restore') return;
+
+  const root = ev.repoRoot || vscode.workspace.workspaceFolders?.[0]?.uri.fsPath || '';
+  if (!root) { vscode.window.showWarningMessage('Workspace root not found.'); return; }
+
+  // Backup current file
+  const backupId = `backup-${Date.now()}`;
+  const backupDir = vscode.Uri.file(path.join(root, '.promptreplay', 'restore_backups', backupId));
+  const backupBeforeDir = vscode.Uri.file(path.join(backupDir.fsPath, 'before'));
+  try { await vscode.workspace.fs.createDirectory(backupBeforeDir); } catch {}
+
+  type BackupEntry = { path: string; existed: boolean; };
+  const entry: BackupEntry = { path: rel, existed: false };
+  const target = vscode.Uri.file(path.join(root, rel));
+  const st = await statMaybe(target);
+  if (st) {
+    entry.existed = true;
+    const backupTarget = vscode.Uri.file(path.join(backupBeforeDir.fsPath, rel));
+    try { await vscode.workspace.fs.createDirectory(vscode.Uri.file(path.dirname(backupTarget.fsPath))); } catch {}
+    const buf = await vscode.workspace.fs.readFile(target);
+    await vscode.workspace.fs.writeFile(backupTarget, buf);
+  }
+  const manifestUri = vscode.Uri.file(path.join(backupDir.fsPath, 'manifest.json'));
+  await vscode.workspace.fs.writeFile(manifestUri, Buffer.from(JSON.stringify([entry], null, 2), 'utf8'));
+
+  // Apply chosen side
+  let didRestore = 0, didDelete = 0, skipped = 0, errors = 0;
+  try {
+    const op = (fileEntry as any).op as string | undefined;
+    const leftUri  = fileEntry.left  ? vscode.Uri.parse(fileEntry.left)  : undefined;
+    const rightUri = fileEntry.right ? vscode.Uri.parse(fileEntry.right) : undefined;
+
+    let snapshotToWrite: vscode.Uri | undefined;
+    let shouldDelete = false;
+
+    if (side === 'after') {
+      shouldDelete = (op === 'deleted');
+      snapshotToWrite = shouldDelete ? undefined : rightUri;
+    } else {
+      shouldDelete = (op === 'added');
+      snapshotToWrite = shouldDelete ? undefined : leftUri;
+    }
+
+    const expectedBase = path.join(root, '.promptreplay', 'snapshots', id);
+    if (!shouldDelete && (!snapshotToWrite || snapshotToWrite.scheme !== 'file' || !snapshotToWrite.fsPath.startsWith(expectedBase))) {
+      skipped++;
+    } else {
+      if (shouldDelete) {
+        try { await vscode.workspace.fs.delete(target, { recursive: false, useTrash: false }); didDelete++; }
+        catch { skipped++; }
+      } else {
+        const buf = await vscode.workspace.fs.readFile(snapshotToWrite!);
+        try { await vscode.workspace.fs.createDirectory(vscode.Uri.file(path.dirname(target.fsPath))); } catch {}
+        await vscode.workspace.fs.writeFile(target, buf);
+        didRestore++;
+      }
+    }
+  } catch {
+    errors++;
+  }
+
+  const undoAction = 'Undo';
+  const summary = `Prompt Replay: file restore (${side.toUpperCase()}) — ${didRestore ? 'restored' : didDelete ? 'deleted' : 'skipped'}${errors ? `, ${errors} errors` : ''}.`;
+  const choice = await vscode.window.showInformationMessage(summary, undoAction);
+
+  if (choice === undoAction) {
+    try {
+      const raw = await vscode.workspace.fs.readFile(manifestUri);
+      const manifestParsed = JSON.parse(Buffer.from(raw).toString('utf8')) as BackupEntry[];
+      const back = manifestParsed[0];
+      const targetUri = vscode.Uri.file(path.join(root, back.path));
+      try {
+        if (back.existed) {
+          const backupFile = vscode.Uri.file(path.join(backupBeforeDir.fsPath, back.path));
+          const buf = await vscode.workspace.fs.readFile(backupFile);
+          try { await vscode.workspace.fs.createDirectory(vscode.Uri.file(path.dirname(targetUri.fsPath))); } catch {}
+          await vscode.workspace.fs.writeFile(targetUri, buf);
+        } else {
+          await vscode.workspace.fs.delete(targetUri, { recursive: false, useTrash: false });
+        }
+        vscode.window.showInformationMessage('Prompt Replay: undo complete for file.');
+      } catch {
+        vscode.window.showErrorMessage('Prompt Replay: undo failed for file.');
+      }
+    } catch {
+      vscode.window.showErrorMessage('Prompt Replay: undo failed (could not read backup).');
+    }
+  }
+}
