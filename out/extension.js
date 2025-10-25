@@ -35,18 +35,18 @@ async function statMaybe(uri) {
 }
 async function activate(context) {
     const store = new store_1.Store(context);
-    // Track edits between checkpoint and logPrompt
+    // Track edits while a checkpoint is active
     const editListener = vscode.workspace.onDidChangeTextDocument((e) => {
         if (!store.session.lastCheckpointSha)
-            return; // only while a checkpoint is active
+            return;
         if (e.document.uri.scheme !== 'file')
-            return; // ignore virtual docs
+            return;
         const rp = relPath(e.document.uri);
         if (rp)
             touchedSinceCheckpoint.add(rp);
     });
     context.subscriptions.push(editListener);
-    // --- Commands ---
+    // Commands
     const startSession = vscode.commands.registerCommand('promptReplay.startSession', async () => {
         const ws = vscode.workspace.workspaceFolders?.[0];
         if (!ws) {
@@ -85,7 +85,6 @@ async function activate(context) {
         let diffs = await (0, git_1.collectWorkingDiff)(repo);
         const repoRoot = store.session.repoRoot ?? (vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? '');
         const checkpointRef = store.session.lastCheckpointSha;
-        // --- Decide what to include ---
         if (checkpointRef) {
             if (touchedSinceCheckpoint.size === 0) {
                 vscode.window.showInformationMessage('Prompt Replay: no edits detected since checkpoint — nothing to log.');
@@ -104,7 +103,7 @@ async function activate(context) {
                 return;
             }
         }
-        // Build event scaffold first (id needed for snapshot path)
+        // Build event scaffold (id needed for snapshot paths)
         const ev = {
             id: (0, crypto_1.randomUUID)(),
             timestamp: Date.now(),
@@ -114,12 +113,10 @@ async function activate(context) {
             beforeRef: checkpointRef,
             afterRef: 'WORKING',
             filesChanged: diffs.map(d => d.path),
-            diffUris: [], // fill below
+            diffUris: [],
             tags
         };
-        // --- Create stable snapshots for BOTH sides so diffs/restores are reliable later ---
-        // LEFT = content at checkpoint (or empty if NEW)
-        // RIGHT = content at log time (or empty + mark deleted)
+        // Create stable snapshots: __before__ (checkpoint) and __after__ (log-time)
         const snapshotsDir = vscode.Uri.file(path.join(repoRoot, '.promptreplay', 'snapshots', ev.id));
         try {
             await vscode.workspace.fs.createDirectory(snapshotsDir);
@@ -140,7 +137,7 @@ async function activate(context) {
         const ops = {};
         for (const d of diffs) {
             const rel = d.path.replace(/\\/g, '/');
-            // LEFT snapshot (checkpoint ref)
+            // left
             const leftText = checkpointRef ? await (0, git_1.getFileAtRef)(repoRoot, checkpointRef, rel) : undefined;
             const leftSnap = vscode.Uri.file(path.join(beforeDir.fsPath, rel));
             try {
@@ -151,10 +148,10 @@ async function activate(context) {
                 await vscode.workspace.fs.writeFile(leftSnap, Buffer.from(leftText, 'utf8'));
             }
             else {
-                await vscode.workspace.fs.writeFile(leftSnap, Buffer.alloc(0)); // NEW file => empty left
+                await vscode.workspace.fs.writeFile(leftSnap, Buffer.alloc(0));
             }
             leftSnapUris[rel] = leftSnap;
-            // RIGHT snapshot (current working content or deleted)
+            // right
             const target = vscode.Uri.file(path.join(repoRoot, rel));
             const rightSnap = vscode.Uri.file(path.join(afterDir.fsPath, rel));
             try {
@@ -173,7 +170,6 @@ async function activate(context) {
             }
             rightSnapUris[rel] = rightSnap;
         }
-        // Use our snapshots for diff URIs so they're stable for later restore
         ev.diffUris = diffs.map(d => {
             const rel = d.path.replace(/\\/g, '/');
             return {
@@ -183,9 +179,7 @@ async function activate(context) {
                 op: ops[rel]
             };
         });
-        // Persist event
         await store.appendEvent(ev, maxEvents);
-        // Reset checkpoint & touched set so the next one is explicit
         touchedSinceCheckpoint.clear();
         store.session = { ...store.session, lastCheckpointSha: undefined };
         vscode.window.showInformationMessage(`Prompt Replay: logged prompt with ${ev.filesChanged.length} changed file(s).`);
@@ -215,19 +209,23 @@ async function activate(context) {
                 }
                 if (message.type === 'search') {
                     const q = (message.q || '').toLowerCase().trim();
-                    eventsAll = await store.readEvents(); // refresh in case of recent logs
+                    eventsAll = await store.readEvents();
                     const filtered = !q ? eventsAll : eventsAll.filter(ev => ev.prompt.toLowerCase().includes(q) ||
                         ev.filesChanged.some(f => f.toLowerCase().includes(q)) ||
                         (ev.tags ?? []).some(t => t.toLowerCase().includes(q)));
                     timelinePanel_1.TimelinePanel.current?.setEvents(filtered);
                     return;
                 }
+                if (message.type === 'exportEvent') {
+                    await exportEventMarkdown(String(message.id || ''), store);
+                    return;
+                }
                 if (message.type === 'restoreEvent') {
-                    await handleRestoreEvent(message, store);
+                    await handleRestoreEvent({ ...message, side: 'after' }, store); // always "this version"
                     return;
                 }
                 if (message.type === 'restoreFile') {
-                    await handleRestoreFile(message, store);
+                    await handleRestoreFile({ ...message, side: 'after' }, store); // always "this version"
                     return;
                 }
             }
@@ -237,7 +235,7 @@ async function activate(context) {
             }
         });
     });
-    // Optional: nudge on large edits
+    // Optional: nudge
     const nudges = vscode.workspace.getConfiguration('promptReplay').get('autoNudgeLargeEdit', true);
     const lineThreshold = vscode.workspace.getConfiguration('promptReplay').get('largeEditLineThreshold', 20);
     let changeAccumulator = 0;
@@ -253,10 +251,193 @@ async function activate(context) {
     context.subscriptions.push(startSession, createCheckpoint, logPrompt, openTimeline, changeSub);
 }
 function deactivate() { }
-/* ---------------- helpers for restore actions ---------------- */
+/* ---------------- Export to Markdown ---------------- */
+async function exportEventMarkdown(id, store) {
+    if (!id) {
+        vscode.window.showWarningMessage('Export failed: missing event id.');
+        return;
+    }
+    const events = await store.readEvents();
+    const ev = events.find(e => e.id === id);
+    if (!ev) {
+        vscode.window.showWarningMessage('Export failed: event not found.');
+        return;
+    }
+    const root = ev.repoRoot || vscode.workspace.workspaceFolders?.[0]?.uri.fsPath || '';
+    if (!root) {
+        vscode.window.showWarningMessage('Export failed: workspace root not found.');
+        return;
+    }
+    const snapsDir = path.join(root, '.promptreplay', 'snapshots', id);
+    const beforeDir = path.join(snapsDir, '__before__');
+    const afterDir = path.join(snapsDir, '__after__');
+    // Build sections
+    const when = new Date(ev.timestamp || Date.now());
+    const dateStr = `${when.toLocaleDateString()} ${when.toLocaleTimeString()}`;
+    const header = [
+        `# Prompt Replay — Event ${id} (${dateStr})`,
+        ``,
+        `**Prompt:** ${codeQuote(ev.prompt || '')}`,
+        ev.tags?.length ? `**Tags:** ${ev.tags.join(', ')}` : ``,
+        `**Repo:** ${root}`,
+        `**Before:** ${ev.beforeRef ? truncateSha(ev.beforeRef) : '—'}  |  **After:** working tree at log time`,
+        ``,
+        `---`,
+        ``,
+    ].filter(Boolean).join('\n');
+    let filesList = [];
+    let fileSections = [];
+    for (const d of ev.diffUris || []) {
+        const rel = d.path;
+        const leftPath = path.join(beforeDir, rel);
+        const rightPath = path.join(afterDir, rel);
+        const leftText = await readUtf8Maybe(vscode.Uri.file(leftPath));
+        const rightText = await readUtf8Maybe(vscode.Uri.file(rightPath));
+        const diff = buildUnifiedDiff(leftText, rightText);
+        const counts = countDiff(diff);
+        const status = !leftText && rightText ? 'Added'
+            : leftText && !rightText ? 'Deleted'
+                : 'Modified';
+        filesList.push(`- **${rel}** — ${status} (+${counts.added} / −${counts.removed})`);
+        const section = [
+            ``,
+            `### ${rel} (${status})`,
+            '```diff',
+            ...diff,
+            '```',
+            ``
+        ].join('\n');
+        fileSections.push(section);
+    }
+    const listBlock = [`## Files changed (${filesList.length})`, ...filesList, ``, `---`, ``].join('\n');
+    if (ev.responsePreview) {
+        fileSections.unshift(`**Response preview:**\n\n> ${ev.responsePreview}\n\n`);
+    }
+    const md = [header, listBlock, ...fileSections].join('\n');
+    // Write to exports/
+    const exportsDir = vscode.Uri.file(path.join(root, '.promptreplay', 'exports'));
+    try {
+        await vscode.workspace.fs.createDirectory(exportsDir);
+    }
+    catch { }
+    const outUri = vscode.Uri.file(path.join(exportsDir.fsPath, `event-${id}.md`));
+    await vscode.workspace.fs.writeFile(outUri, Buffer.from(md, 'utf8'));
+    const doc = await vscode.workspace.openTextDocument(outUri);
+    await vscode.window.showTextDocument(doc, { preview: false });
+    vscode.window.showInformationMessage(`Prompt Replay: exported to ${outUri.fsPath}`);
+}
+/* ---------- tiny diff utils (dependency-free) ---------- */
+function codeQuote(s) {
+    // Wrap long prompt safely
+    const cleaned = s.replace(/\r/g, '');
+    if (cleaned.includes('\n'))
+        return `\n\n> ${cleaned.split('\n').join('\n> ')}\n`;
+    return `“${cleaned}”`;
+}
+function truncateSha(ref) {
+    if (!ref)
+        return '—';
+    if (ref.startsWith(':working:'))
+        return 'working';
+    return ref.length > 8 ? ref.slice(0, 8) : ref;
+}
+async function readUtf8Maybe(uri) {
+    try {
+        const buf = await vscode.workspace.fs.readFile(uri);
+        return Buffer.from(buf).toString('utf8');
+    }
+    catch {
+        return '';
+    }
+}
+// Simple LCS-based line diff. Returns unified-diff style lines with prefixes.
+function buildUnifiedDiff(before, after) {
+    const A = (before ?? '').split('\n');
+    const B = (after ?? '').split('\n');
+    const n = A.length, m = B.length;
+    const dp = Array.from({ length: n + 1 }, () => Array(m + 1).fill(0));
+    for (let i = n - 1; i >= 0; i--) {
+        for (let j = m - 1; j >= 0; j--) {
+            if (A[i] === B[j])
+                dp[i][j] = dp[i + 1][j + 1] + 1;
+            else
+                dp[i][j] = Math.max(dp[i + 1][j], dp[i][j + 1]);
+        }
+    }
+    const ops = [];
+    let i = 0, j = 0;
+    while (i < n && j < m) {
+        if (A[i] === B[j]) {
+            ops.push({ t: ' ', s: A[i] });
+            i++;
+            j++;
+        }
+        else if (dp[i + 1][j] >= dp[i][j + 1]) {
+            ops.push({ t: '-', s: A[i] });
+            i++;
+        }
+        else {
+            ops.push({ t: '+', s: B[j] });
+            j++;
+        }
+    }
+    while (i < n) {
+        ops.push({ t: '-', s: A[i++] });
+    }
+    while (j < m) {
+        ops.push({ t: '+', s: B[j++] });
+    }
+    // Compact unchanged runs to keep exports readable (context = 3)
+    const context = 3;
+    const out = [];
+    let k = 0;
+    while (k < ops.length) {
+        if (ops[k].t !== ' ') {
+            // emit a hunk with some leading context
+            let start = k;
+            while (start > 0 && start - 1 >= 0 && ops[start - 1].t === ' ' && (k - (start - 1)) <= context)
+                start--;
+            // find end
+            let end = k;
+            while (end < ops.length && ops[end].t !== ' ')
+                end++;
+            let tail = end;
+            while (tail < ops.length && ops[tail].t === ' ' && (tail - end) <= context)
+                tail++;
+            // add lines
+            for (let x = start; x < tail; x++) {
+                if (ops[x].t === ' ')
+                    out.push(' ' + ops[x].s);
+                else
+                    out.push(ops[x].t + ops[x].s);
+            }
+            if (tail < ops.length)
+                out.push('...');
+            k = tail;
+        }
+        else {
+            k++;
+        }
+    }
+    // Edge case: no changes
+    if (out.length === 0 && A.length === B.length && A.every((v, idx) => v === B[idx])) {
+        return [' (no changes) '];
+    }
+    return out;
+}
+function countDiff(lines) {
+    let added = 0, removed = 0;
+    for (const l of lines) {
+        if (l.startsWith('+'))
+            added++;
+        else if (l.startsWith('-'))
+            removed++;
+    }
+    return { added, removed };
+}
+/* ---------------- restore helpers (already present) ---------------- */
 async function handleRestoreEvent(message, store) {
     const id = String(message.id || '');
-    const side = (message.side === 'before' ? 'before' : 'after'); // default AFTER
     if (!id) {
         vscode.window.showWarningMessage('Missing event id.');
         return;
@@ -267,8 +448,7 @@ async function handleRestoreEvent(message, store) {
         vscode.window.showWarningMessage('Event not found.');
         return;
     }
-    const prettySide = side === 'after' ? 'AFTER (state at log time)' : 'BEFORE (state at checkpoint)';
-    const confirm = await vscode.window.showWarningMessage(`Restore ${ev.filesChanged.length} file(s) to ${prettySide}? This will overwrite your working copies.`, { modal: true }, 'Restore');
+    const confirm = await vscode.window.showWarningMessage(`Restore ${ev.filesChanged.length} file(s) to this version? This will overwrite your working copies.`, { modal: true }, 'Restore');
     if (confirm !== 'Restore')
         return;
     const root = ev.repoRoot || vscode.workspace.workspaceFolders?.[0]?.uri.fsPath || '';
@@ -276,7 +456,7 @@ async function handleRestoreEvent(message, store) {
         vscode.window.showWarningMessage('Workspace root not found.');
         return;
     }
-    // --- Pre-restore backup so we can Undo ---
+    // backup
     const backupId = `backup-${Date.now()}`;
     const backupDir = vscode.Uri.file(path.join(root, '.promptreplay', 'restore_backups', backupId));
     const backupBeforeDir = vscode.Uri.file(path.join(backupDir.fsPath, 'before'));
@@ -285,7 +465,6 @@ async function handleRestoreEvent(message, store) {
     }
     catch { }
     const manifest = [];
-    // Backup all target files
     for (const d of ev.diffUris || []) {
         const rel = d.path;
         const target = vscode.Uri.file(path.join(root, rel));
@@ -305,33 +484,17 @@ async function handleRestoreEvent(message, store) {
     }
     const manifestUri = vscode.Uri.file(path.join(backupDir.fsPath, 'manifest.json'));
     await vscode.workspace.fs.writeFile(manifestUri, Buffer.from(JSON.stringify(manifest, null, 2), 'utf8'));
-    // --- Apply snapshot from the chosen side ---
+    // apply AFTER snapshots
     let restored = 0, deleted = 0, skipped = 0, errors = 0;
     for (const d of ev.diffUris || []) {
         const rel = d.path;
         const target = vscode.Uri.file(path.join(root, rel));
         try {
-            const leftStr = d.left || '';
             const rightStr = d.right || '';
-            const leftUri = leftStr ? vscode.Uri.parse(leftStr) : undefined;
             const rightUri = rightStr ? vscode.Uri.parse(rightStr) : undefined;
             const op = d.op;
-            let snapshotToWrite;
-            let shouldDelete = false;
-            if (side === 'after') {
-                shouldDelete = (op === 'deleted');
-                snapshotToWrite = shouldDelete ? undefined : rightUri;
-            }
-            else {
-                shouldDelete = (op === 'added');
-                snapshotToWrite = shouldDelete ? undefined : leftUri;
-            }
             const expectedBase = path.join(root, '.promptreplay', 'snapshots', id);
-            if (!shouldDelete && (!snapshotToWrite || snapshotToWrite.scheme !== 'file' || !snapshotToWrite.fsPath.startsWith(expectedBase))) {
-                skipped++;
-                continue;
-            }
-            if (shouldDelete) {
+            if (op === 'deleted') {
                 try {
                     await vscode.workspace.fs.delete(target, { recursive: false, useTrash: false });
                     deleted++;
@@ -340,8 +503,11 @@ async function handleRestoreEvent(message, store) {
                     skipped++;
                 }
             }
+            else if (!rightUri || rightUri.scheme !== 'file' || !rightUri.fsPath.startsWith(expectedBase)) {
+                skipped++;
+            }
             else {
-                const buf = await vscode.workspace.fs.readFile(snapshotToWrite);
+                const buf = await vscode.workspace.fs.readFile(rightUri);
                 try {
                     await vscode.workspace.fs.createDirectory(vscode.Uri.file(path.dirname(target.fsPath)));
                 }
@@ -355,9 +521,9 @@ async function handleRestoreEvent(message, store) {
         }
     }
     const undoAction = 'Undo';
-    const summary = `Prompt Replay: restore (${side.toUpperCase()}) — ${restored} restored, ${deleted} deleted, ${skipped} skipped${errors ? `, ${errors} errors` : ''}.`;
+    const summary = `Prompt Replay: restore — ${restored} restored, ${deleted} deleted, ${skipped} skipped${errors ? `, ${errors} errors` : ''}.`;
     const choice = await vscode.window.showInformationMessage(summary, undoAction);
-    if (choice === undoAction) {
+    if (choice === 'Undo') {
         let uRestored = 0, uDeleted = 0, uErrors = 0;
         try {
             const raw = await vscode.workspace.fs.readFile(manifestUri);
@@ -394,7 +560,6 @@ async function handleRestoreEvent(message, store) {
 }
 async function handleRestoreFile(message, store) {
     const id = String(message.id || '');
-    const side = (message.side === 'before' ? 'before' : 'after');
     const rel = String(message.path || '');
     if (!id || !rel) {
         vscode.window.showWarningMessage('Missing event id or file path.');
@@ -411,8 +576,7 @@ async function handleRestoreFile(message, store) {
         vscode.window.showWarningMessage('File not part of this event.');
         return;
     }
-    const prettySide = side === 'after' ? 'AFTER (state at log time)' : 'BEFORE (state at checkpoint)';
-    const confirm = await vscode.window.showWarningMessage(`Restore file "${rel}" to ${prettySide}? This will overwrite your working copy.`, { modal: true }, 'Restore');
+    const confirm = await vscode.window.showWarningMessage(`Restore file “${rel}” to this version? This will overwrite your working copy.`, { modal: true }, 'Restore');
     if (confirm !== 'Restore')
         return;
     const root = ev.repoRoot || vscode.workspace.workspaceFolders?.[0]?.uri.fsPath || '';
@@ -420,7 +584,7 @@ async function handleRestoreFile(message, store) {
         vscode.window.showWarningMessage('Workspace root not found.');
         return;
     }
-    // Backup current file
+    // backup current file
     const backupId = `backup-${Date.now()}`;
     const backupDir = vscode.Uri.file(path.join(root, '.promptreplay', 'restore_backups', backupId));
     const backupBeforeDir = vscode.Uri.file(path.join(backupDir.fsPath, 'before'));
@@ -443,58 +607,44 @@ async function handleRestoreFile(message, store) {
     }
     const manifestUri = vscode.Uri.file(path.join(backupDir.fsPath, 'manifest.json'));
     await vscode.workspace.fs.writeFile(manifestUri, Buffer.from(JSON.stringify([entry], null, 2), 'utf8'));
-    // Apply chosen side
+    // apply AFTER snapshot
     let didRestore = 0, didDelete = 0, skipped = 0, errors = 0;
     try {
         const op = fileEntry.op;
-        const leftUri = fileEntry.left ? vscode.Uri.parse(fileEntry.left) : undefined;
         const rightUri = fileEntry.right ? vscode.Uri.parse(fileEntry.right) : undefined;
-        let snapshotToWrite;
-        let shouldDelete = false;
-        if (side === 'after') {
-            shouldDelete = (op === 'deleted');
-            snapshotToWrite = shouldDelete ? undefined : rightUri;
-        }
-        else {
-            shouldDelete = (op === 'added');
-            snapshotToWrite = shouldDelete ? undefined : leftUri;
-        }
         const expectedBase = path.join(root, '.promptreplay', 'snapshots', id);
-        if (!shouldDelete && (!snapshotToWrite || snapshotToWrite.scheme !== 'file' || !snapshotToWrite.fsPath.startsWith(expectedBase))) {
+        if (op === 'deleted') {
+            try {
+                await vscode.workspace.fs.delete(target, { recursive: false, useTrash: false });
+                didDelete++;
+            }
+            catch {
+                skipped++;
+            }
+        }
+        else if (!rightUri || rightUri.scheme !== 'file' || !rightUri.fsPath.startsWith(expectedBase)) {
             skipped++;
         }
         else {
-            if (shouldDelete) {
-                try {
-                    await vscode.workspace.fs.delete(target, { recursive: false, useTrash: false });
-                    didDelete++;
-                }
-                catch {
-                    skipped++;
-                }
+            const buf = await vscode.workspace.fs.readFile(rightUri);
+            try {
+                await vscode.workspace.fs.createDirectory(vscode.Uri.file(path.dirname(target.fsPath)));
             }
-            else {
-                const buf = await vscode.workspace.fs.readFile(snapshotToWrite);
-                try {
-                    await vscode.workspace.fs.createDirectory(vscode.Uri.file(path.dirname(target.fsPath)));
-                }
-                catch { }
-                await vscode.workspace.fs.writeFile(target, buf);
-                didRestore++;
-            }
+            catch { }
+            await vscode.workspace.fs.writeFile(target, buf);
+            didRestore++;
         }
     }
     catch {
         errors++;
     }
     const undoAction = 'Undo';
-    const summary = `Prompt Replay: file restore (${side.toUpperCase()}) — ${didRestore ? 'restored' : didDelete ? 'deleted' : 'skipped'}${errors ? `, ${errors} errors` : ''}.`;
+    const summary = `Prompt Replay: file restore — ${didRestore ? 'restored' : didDelete ? 'deleted' : 'skipped'}${errors ? `, ${errors} errors` : ''}.`;
     const choice = await vscode.window.showInformationMessage(summary, undoAction);
-    if (choice === undoAction) {
+    if (choice === 'Undo') {
         try {
             const raw = await vscode.workspace.fs.readFile(manifestUri);
-            const manifestParsed = JSON.parse(Buffer.from(raw).toString('utf8'));
-            const back = manifestParsed[0];
+            const [back] = JSON.parse(Buffer.from(raw).toString('utf8'));
             const targetUri = vscode.Uri.file(path.join(root, back.path));
             try {
                 if (back.existed) {

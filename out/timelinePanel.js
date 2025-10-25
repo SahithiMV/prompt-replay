@@ -25,7 +25,10 @@ class TimelinePanel {
         this.panel.webview.onDidReceiveMessage(handler);
     }
     esc(s) {
-        return (s ?? '').toString().replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+        return (s ?? '').toString()
+            .replace(/&/g, '&amp;')
+            .replace(/</g, '&lt;')
+            .replace(/>/g, '&gt;');
     }
     renderHtml(events) {
         const rows = (events ?? []).map(ev => {
@@ -54,11 +57,8 @@ class TimelinePanel {
                   data-title="${encodeURIComponent('Prompt Replay • ' + rel)}">
                   View Diff
                 </button>
-                <button class="btn small" data-cmd="restoreFile" data-side="after" data-id="${this.esc(id)}" data-path="${this.esc(rel)}" title="Restore this file to state at log time">
-                  Restore file (After)
-                </button>
-                <button class="btn small" data-cmd="restoreFile" data-side="before" data-id="${this.esc(id)}" data-path="${this.esc(rel)}" title="Restore this file to checkpoint state">
-                  Restore file (Before)
+                <button class="btn small" data-cmd="restoreFile" data-id="${this.esc(id)}" data-path="${this.esc(rel)}" title="Restore this file to this version">
+                  Restore file
                 </button>
               </div>
             </td>
@@ -71,11 +71,11 @@ class TimelinePanel {
             <span class="time">🕒 ${this.esc(date)}</span>
             <span class="files">📄 ${files} file${files === 1 ? '' : 's'}</span>
             <span class="spacer"></span>
-            <button class="btn danger" data-cmd="restoreEvent" data-side="after" data-id="${this.esc(id)}" title="Restore workspace to this prompt's AFTER state">
-              Restore After
+            <button class="btn" data-cmd="exportEvent" data-id="${this.esc(id)}" title="Export this event to Markdown">
+              Export
             </button>
-            <button class="btn" data-cmd="restoreEvent" data-side="before" data-id="${this.esc(id)}" title="Restore workspace to this prompt's BEFORE (checkpoint) state">
-              Restore Before
+            <button class="btn danger" data-cmd="restoreEvent" data-id="${this.esc(id)}" title="Restore workspace to this version">
+              Restore
             </button>
           </div>
           <div class="prompt">“${this.esc(promptShort)}” ${tags}</div>
@@ -132,9 +132,7 @@ class TimelinePanel {
   <script>
     const vscode = acquireVsCodeApi();
 
-    // persistent UI state
     const st = Object.assign({ q: '', sort: 'newest', collapsedIds: {} }, vscode.getState() || {});
-
     const search = document.getElementById('search');
     const btnRun = document.getElementById('run');
     const btnSort = document.getElementById('sort');
@@ -186,7 +184,7 @@ class TimelinePanel {
       btnSort.textContent = 'Sort: ' + (st.sort === 'oldest' ? 'Oldest' : 'Newest');
       vscode.setState(st);
 
-      // reapply collapsed arrows (DOM rebuilt)
+      // reapply collapsed arrows
       for (const ev of grid.querySelectorAll('.event')) {
         const id = ev.getAttribute('data-id');
         const body = ev.querySelector('.body');
@@ -217,7 +215,7 @@ class TimelinePanel {
       for (const ev of grid.querySelectorAll('.event')) setCollapsed(ev, false);
     });
 
-    // body click: per-event toggle + restore + openDiff + per-file restore
+    // body click: toggle / restore / export / openDiff / per-file restore
     document.body.addEventListener('click', (e) => {
       const btn = e.target.closest('button');
       if (!btn) return;
@@ -227,23 +225,27 @@ class TimelinePanel {
 
       if (cmd === 'toggle') {
         const evEl = btn.closest('.event');
-        const currentlyCollapsed = evEl.querySelector('.body')?.classList.contains('hidden');
-        setCollapsed(evEl, !currentlyCollapsed);
+        const collapsed = evEl.querySelector('.body')?.classList.contains('hidden');
+        setCollapsed(evEl, !collapsed);
+        return;
+      }
+
+      if (cmd === 'exportEvent') {
+        const id = btn.getAttribute('data-id');
+        vscode.postMessage({ type: 'exportEvent', id });
         return;
       }
 
       if (cmd === 'restoreEvent') {
         const id = btn.getAttribute('data-id');
-        const side = btn.getAttribute('data-side') || 'after';
-        vscode.postMessage({ type: 'restoreEvent', id, side });
+        vscode.postMessage({ type: 'restoreEvent', id }); // restore "this version" (after)
         return;
       }
 
       if (cmd === 'restoreFile') {
         const id = btn.getAttribute('data-id');
-        const side = btn.getAttribute('data-side') || 'after';
         const path = btn.getAttribute('data-path');
-        vscode.postMessage({ type: 'restoreFile', id, side, path });
+        vscode.postMessage({ type: 'restoreFile', id, path }); // restore file to "this version"
         return;
       }
 
@@ -256,7 +258,6 @@ class TimelinePanel {
       }
     });
 
-    // initial sort
     applySort();
   </script>
 </body>
