@@ -1,15 +1,19 @@
 import * as vscode from 'vscode';
 import { PromptEvent } from './types';
+import { EventSummary } from './ai';
 
 type WebState = {
   q: string;
   sort: 'newest' | 'oldest';
   collapsedIds: Record<string, boolean>;
+  mode: 'active' | 'trash';
 };
 
 export class TimelinePanel {
   public static current?: TimelinePanel;
   private panel: vscode.WebviewPanel;
+  private summaries: Record<string, EventSummary> = {};
+  private trashed: Set<string> = new Set();
 
   private constructor(panel: vscode.WebviewPanel) {
     this.panel = panel;
@@ -21,7 +25,6 @@ export class TimelinePanel {
       TimelinePanel.current.panel.reveal(column);
       return TimelinePanel.current;
     }
-
     const panel = vscode.window.createWebviewPanel(
       'promptReplay.timeline',
       'Prompt Replay Timeline',
@@ -34,7 +37,9 @@ export class TimelinePanel {
     return inst;
   }
 
-  setEvents(events: PromptEvent[]) {
+  setEvents(events: PromptEvent[], summariesById?: Record<string, EventSummary>, trashedIds?: Set<string>) {
+    this.summaries = summariesById || {};
+    this.trashed = trashedIds ? new Set(trashedIds) : new Set();
     this.panel.webview.html = this.renderHtml(events || []);
   }
 
@@ -49,62 +54,68 @@ export class TimelinePanel {
   private renderHtml(events: PromptEvent[]): string {
     const rows = (events ?? []).map(ev => {
       const ts = Number(ev.timestamp ?? Date.now());
-      const id = String(ev.id ?? `${ts}-${Math.random().toString(36).slice(2)}`);
+      const id = this.esc(String(ev.id ?? `${ts}-${Math.random().toString(36).slice(2)}`));
       const date = new Date(ts).toLocaleString();
       const files = ev.filesChanged?.length ?? 0;
       const promptTxt = String(ev.prompt ?? '');
       const promptShort = promptTxt.length > 200 ? promptTxt.slice(0,197) + '…' : promptTxt;
       const tags = (ev.tags ?? []).map(t => `<span class="tag">${this.esc(String(t))}</span>`).join(' ');
-      const responsePreviewStr = (ev as any).responsePreview ? String((ev as any).responsePreview) : '';
+      const sum = this.summaries[id];
+      const isTrashed = this.trashed.has(id);
 
       const fileRows = (ev.diffUris ?? []).map(d => {
         const left = d.left ?? '';
         const right = d.right ?? '';
-        const rel = String(d.path ?? '');
+        const encPath = encodeURIComponent(String(d.path ?? ''));
         return `
           <tr>
-            <td class="path">${this.esc(rel)}</td>
+            <td class="path">${this.esc(String(d.path ?? ''))}</td>
             <td class="actions">
-              <div class="row-actions">
-                <button
-                  class="btn"
-                  data-cmd="openDiff"
-                  data-left="${encodeURIComponent(left)}"
-                  data-right="${encodeURIComponent(right)}"
-                  data-title="${encodeURIComponent('Prompt Replay • ' + rel)}">
-                  View Diff
-                </button>
-                <button class="btn small" data-cmd="restoreFile" data-id="${this.esc(id)}" data-path="${this.esc(rel)}" data-side="after" title="Restore this file (after)">
-                  Restore file
-                </button>
-              </div>
+              <button class="btn" data-cmd="openDiff"
+                data-left="${encodeURIComponent(left)}"
+                data-right="${encodeURIComponent(right)}"
+                data-title="${encodeURIComponent('Prompt Replay • ' + (d.path ?? ''))}">
+                View Diff
+              </button>
+              <button class="btn" data-cmd="restoreFileBefore" data-event="${id}" data-path="${encPath}">Restore Before</button>
+              <button class="btn" data-cmd="restoreFileAfter"  data-event="${id}" data-path="${encPath}">Restore After</button>
             </td>
           </tr>`;
       }).join('');
 
+      const summaryBlock = sum ? `
+        <div class="summary">
+          <div class="summary-hdr">🧠 Summary <span class="meta">(${this.esc(sum.model)} • ${new Date(sum.createdAt).toLocaleString()})</span></div>
+          <div class="overall">${this.esc(sum.overall || '')}</div>
+          ${(sum.files || []).slice(0, 6).map(f => `<div class="file-sum"><span class="p">${this.esc(f.path)}:</span> ${this.esc(f.summary)}</div>`).join('')}
+          ${(sum.files?.length || 0) > 6 ? `<div class="muted">…and ${sum.files!.length - 6} more</div>` : ''}
+        </div>
+      ` : '';
+
+      const sumBtnLabel = sum ? 'Regenerate Summary' : 'Summarize';
+
+      const trashButtons = !isTrashed
+        ? `<button class="btn warn" data-cmd="trashEvent" data-event="${id}">Move to Trash</button>`
+        : `
+           <button class="btn"      data-cmd="restoreFromTrash" data-event="${id}">Restore from Trash</button>
+           <button class="btn warn" data-cmd="deletePermanent"  data-event="${id}">Delete Permanently</button>
+          `;
+
       return `
-        <div class="event" data-id="${this.esc(id)}" data-ts="${ts}">
+        <div class="event" data-id="${id}" data-ts="${ts}">
           <div class="hdr">
             <button class="toggle" title="Collapse/Expand" data-cmd="toggle">▾</button>
             <span class="time">🕒 ${this.esc(date)}</span>
             <span class="files">📄 ${files} file${files === 1 ? '' : 's'}</span>
             <span class="spacer"></span>
-            <button class="btn" data-cmd="exportEvent" data-id="${this.esc(id)}" title="Export this event to Markdown">
-              Export
-            </button>
-            <button class="btn" data-cmd="restoreEvent" data-id="${this.esc(id)}" data-side="before" title="Restore workspace to BEFORE this event">
-              Restore Before
-            </button>
-            <button class="btn" data-cmd="restoreEvent" data-id="${this.esc(id)}" data-side="after" title="Restore workspace to AFTER this event">
-              Restore After
-            </button>
-            <button class="btn danger" data-cmd="deleteEvent" data-id="${this.esc(id)}" title="Delete this event and move its data to trash">
-              Delete
-            </button>
+            <button class="btn" data-cmd="summarize" data-event="${id}">${sumBtnLabel}</button>
+            <button class="btn" data-cmd="restoreAllBefore" data-event="${id}">Restore Before (All)</button>
+            <button class="btn" data-cmd="restoreAllAfter"  data-event="${id}">Restore After (All)</button>
+            ${trashButtons}
           </div>
           <div class="prompt">“${this.esc(promptShort)}” ${tags}</div>
           <div class="body">
-            ${responsePreviewStr ? `<div class="muted">↳ ${this.esc(responsePreviewStr)}</div>` : ''}
+            ${summaryBlock}
             <table class="files"><tbody>${fileRows}</tbody></table>
           </div>
         </div>`;
@@ -119,12 +130,9 @@ export class TimelinePanel {
     .toolbar { display:flex; gap:8px; margin-bottom:10px; align-items:center; }
     input[type="text"] { flex:1; padding:6px; }
     button { cursor:pointer; }
-    #grid { display:block; }
     .event { border: 1px solid var(--vscode-panel-border); border-radius: 8px; padding: 10px; margin-bottom: 10px; }
     .hdr { display: flex; gap: 12px; font-size: 12px; opacity: 0.9; margin-bottom: 6px; align-items:center; }
-    .spacer { flex:1; }
-    .toggle { border: 1px solid var(--vscode-panel-border); background: var(--vscode-button-secondaryBackground);
-              color: var(--vscode-button-secondaryForeground); border-radius: 6px; padding: 2px 8px; }
+    .spacer { flex: 1; }
     .prompt { margin: 6px 0 8px; font-weight: 600; }
     .body.hidden { display: none; }
     table.files { width: 100%; border-collapse: collapse; }
@@ -134,22 +142,27 @@ export class TimelinePanel {
     .muted { opacity:.7; }
     .btn { background: var(--vscode-button-secondaryBackground); color: var(--vscode-button-secondaryForeground);
            border: 1px solid var(--vscode-panel-border); border-radius: 6px; padding: 4px 8px; }
-    .btn.danger { background: var(--vscode-inputValidation-errorBackground);
-                  color: var(--vscode-errorForeground);
-                  border-color: var(--vscode-inputValidation-errorBorder); }
-    .row-actions { display: inline-flex; gap: 6px; align-items: center; }
-    .btn.small { padding: 2px 6px; font-size: 11px; }
+    .btn.warn { border-color: var(--vscode-editorWarning-foreground); }
+    .toggle { border: 1px solid var(--vscode-panel-border); background: var(--vscode-button-secondaryBackground);
+              color: var(--vscode-button-secondaryForeground); border-radius: 6px; padding: 2px 8px; }
+    .summary { background: var(--vscode-editor-inactiveSelectionBackground); border-radius: 6px; padding: 8px; margin: 6px 0 10px; }
+    .summary-hdr { font-weight: 600; margin-bottom: 4px; }
+    .summary .meta { opacity: .7; font-weight: 400; margin-left: 6px; }
+    .file-sum .p { font-family: var(--vscode-editor-font-family); opacity: .9; }
+    .modeBadge { opacity: .8; font-size: 12px; }
   </style>
 </head>
 <body>
   <div class="toolbar">
     <input id="search" placeholder="Search prompts/files/tags… (Enter or click Search)" />
     <button id="run">Search</button>
+    <button id="clear">Clear</button>
     <button id="sort">Sort: Newest</button>
-    <button id="collapseAll" title="Collapse all">Collapse all</button>
-    <button id="expandAll" title="Expand all">Expand all</button>
-    <span style="flex:1"></span>
-    <button id="openTrash">Trash…</button>
+    <button id="collapseAll">Collapse all</button>
+    <button id="expandAll">Expand all</button>
+    <span class="spacer"></span>
+    <span class="modeBadge" id="modeBadge"></span>
+    <button id="toggleMode">Show Trash</button>
   </div>
 
   <div id="grid">
@@ -158,28 +171,38 @@ export class TimelinePanel {
 
   <script>
     const vscode = acquireVsCodeApi();
-
-    const st = Object.assign({ q: '', sort: 'newest', collapsedIds: {} }, vscode.getState() || {});
+    const st = Object.assign({ q: '', sort: 'newest', collapsedIds: {}, mode: 'active' }, vscode.getState() || {});
     const search = document.getElementById('search');
     const btnRun = document.getElementById('run');
+    const btnClear = document.getElementById('clear');
     const btnSort = document.getElementById('sort');
     const btnCollapseAll = document.getElementById('collapseAll');
     const btnExpandAll = document.getElementById('expandAll');
-    const btnOpenTrash = document.getElementById('openTrash');
+    const btnToggleMode = document.getElementById('toggleMode');
+    const modeBadge = document.getElementById('modeBadge');
     const grid = document.getElementById('grid');
+
+    function updateModeUI() {
+      btnToggleMode.textContent = st.mode === 'active' ? 'Show Trash' : 'Show Active';
+      modeBadge.textContent = st.mode === 'active' ? '' : 'Viewing: Trash';
+    }
 
     search.value = st.q || '';
     btnSort.textContent = 'Sort: ' + (st.sort === 'oldest' ? 'Oldest' : 'Newest');
+    updateModeUI();
 
-    for (const ev of grid.querySelectorAll('.event')) {
-      const id = ev.getAttribute('data-id');
-      const body = ev.querySelector('.body');
-      const toggleBtn = ev.querySelector('.toggle');
-      if (st.collapsedIds[id]) {
-        body?.classList.add('hidden');
-        if (toggleBtn) toggleBtn.textContent = '▸';
-      } else {
-        if (toggleBtn) toggleBtn.textContent = '▾';
+    function applyCollapsedState() {
+      for (const ev of grid.querySelectorAll('.event')) {
+        const id = ev.getAttribute('data-id');
+        const body = ev.querySelector('.body');
+        const toggleBtn = ev.querySelector('.toggle');
+        if (st.collapsedIds[id]) {
+          body?.classList.add('hidden');
+          if (toggleBtn) toggleBtn.textContent = '▸';
+        } else {
+          body?.classList.remove('hidden');
+          if (toggleBtn) toggleBtn.textContent = '▾';
+        }
       }
     }
 
@@ -210,78 +233,42 @@ export class TimelinePanel {
       for (const c of cards) grid.appendChild(c);
       btnSort.textContent = 'Sort: ' + (st.sort === 'oldest' ? 'Oldest' : 'Newest');
       vscode.setState(st);
-
-      for (const ev of grid.querySelectorAll('.event')) {
-        const id = ev.getAttribute('data-id');
-        const body = ev.querySelector('.body');
-        const toggleBtn = ev.querySelector('.toggle');
-        if (st.collapsedIds[id]) {
-          body?.classList.add('hidden');
-          if (toggleBtn) toggleBtn.textContent = '▸';
-        } else {
-          if (toggleBtn) toggleBtn.textContent = '▾';
-        }
-      }
+      applyCollapsedState();
     }
 
     function runSearch() {
       const q = search.value;
-      vscode.setState(Object.assign(st, { q }));
+      st.q = q;
+      vscode.setState(st);
       vscode.postMessage({ type: 'search', q });
     }
 
+    // toolbar handlers
     btnRun.addEventListener('click', runSearch);
+    btnClear.addEventListener('click', () => { search.value = ''; runSearch(); });
     search.addEventListener('keydown', (e) => { if (e.key === 'Enter') runSearch(); });
     btnSort.addEventListener('click', () => { st.sort = (st.sort === 'newest' ? 'oldest' : 'newest'); applySort(); });
-    btnCollapseAll.addEventListener('click', () => {
-      for (const ev of grid.querySelectorAll('.event')) setCollapsed(ev, true);
-    });
-    btnExpandAll.addEventListener('click', () => {
-      for (const ev of grid.querySelectorAll('.event')) setCollapsed(ev, false);
-    });
-
-    btnOpenTrash.addEventListener('click', () => {
-      vscode.postMessage({ type: 'openTrash' });
+    btnCollapseAll.addEventListener('click', () => { for (const ev of grid.querySelectorAll('.event')) setCollapsed(ev, true); });
+    btnExpandAll.addEventListener('click', () => { for (const ev of grid.querySelectorAll('.event')) setCollapsed(ev, false); });
+    btnToggleMode.addEventListener('click', () => {
+      st.mode = (st.mode === 'active' ? 'trash' : 'active');
+      vscode.setState(st);
+      updateModeUI();
+      vscode.postMessage({ type: 'switchMode', mode: st.mode });
     });
 
+    // body click
     document.body.addEventListener('click', (e) => {
       const btn = e.target.closest('button');
       if (!btn) return;
-
       const cmd = btn.getAttribute('data-cmd');
-      if (btn.id === 'run' || btn.id === 'sort' || btn.id === 'collapseAll' || btn.id === 'expandAll' || btn.id === 'openTrash') return;
+
+      if (btn.id === 'run' || btn.id === 'clear' || btn.id === 'sort' || btn.id === 'collapseAll' || btn.id === 'expandAll' || btn.id === 'toggleMode') return;
 
       if (cmd === 'toggle') {
         const evEl = btn.closest('.event');
         const collapsed = evEl.querySelector('.body')?.classList.contains('hidden');
         setCollapsed(evEl, !collapsed);
-        return;
-      }
-
-      if (cmd === 'exportEvent') {
-        const id = btn.getAttribute('data-id');
-        vscode.postMessage({ type: 'exportEvent', id });
-        return;
-      }
-
-      if (cmd === 'restoreEvent') {
-        const id = btn.getAttribute('data-id');
-        const side = btn.getAttribute('data-side') || 'after';
-        vscode.postMessage({ type: 'restoreEvent', id, side });
-        return;
-      }
-
-      if (cmd === 'deleteEvent') {
-        const id = btn.getAttribute('data-id');
-        vscode.postMessage({ type: 'deleteEvent', id });
-        return;
-      }
-
-      if (cmd === 'restoreFile') {
-        const id = btn.getAttribute('data-id');
-        const path = btn.getAttribute('data-path');
-        const side = btn.getAttribute('data-side') || 'after';
-        vscode.postMessage({ type: 'restoreFile', id, path, side });
         return;
       }
 
@@ -292,9 +279,48 @@ export class TimelinePanel {
         vscode.postMessage({ type: 'openDiff', left, right, title });
         return;
       }
+
+      if (cmd === 'summarize') {
+        const eventId = btn.getAttribute('data-event');
+        vscode.postMessage({ type: 'summarize', eventId });
+        return;
+      }
+
+      if (cmd === 'restoreAllBefore' || cmd === 'restoreAllAfter') {
+        const eventId = btn.getAttribute('data-event');
+        const side = cmd.endsWith('Before') ? 'before' : 'after';
+        vscode.postMessage({ type: 'restoreAll', eventId, side });
+        return;
+      }
+
+      if (cmd === 'restoreFileBefore' || cmd === 'restoreFileAfter') {
+        const eventId = btn.getAttribute('data-event');
+        const pathEnc = btn.getAttribute('data-path') || '';
+        const side = cmd.endsWith('Before') ? 'before' : 'after';
+        vscode.postMessage({ type: 'restoreFile', eventId, path: decodeURIComponent(pathEnc), side });
+        return;
+      }
+
+      if (cmd === 'trashEvent') {
+        const eventId = btn.getAttribute('data-event');
+        vscode.postMessage({ type: 'trashEvent', eventId });
+        return;
+      }
+      if (cmd === 'restoreFromTrash') {
+        const eventId = btn.getAttribute('data-event');
+        vscode.postMessage({ type: 'restoreFromTrash', eventId });
+        return;
+      }
+      if (cmd === 'deletePermanent') {
+        const eventId = btn.getAttribute('data-event');
+        vscode.postMessage({ type: 'deletePermanent', eventId });
+        return;
+      }
     });
 
+    // initial
     applySort();
+    applyCollapsedState();
   </script>
 </body>
 </html>`;

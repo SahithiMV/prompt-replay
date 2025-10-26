@@ -8,6 +8,7 @@ const crypto_1 = require("crypto");
 const store_1 = require("./store");
 const timelinePanel_1 = require("./timelinePanel");
 const git_1 = require("./git");
+const ai_1 = require("./ai");
 console.log('[Prompt Replay] activate()');
 const touchedSinceCheckpoint = new Set();
 function relPath(uri) {
@@ -24,51 +25,41 @@ async function exists(uri) {
         return false;
     }
 }
-async function statMaybe(uri) {
+async function readUtf8(uri) {
+    if (!uri)
+        return;
     try {
-        return await vscode.workspace.fs.stat(uri);
+        const buf = await vscode.workspace.fs.readFile(uri);
+        return { text: Buffer.from(buf).toString('utf8'), size: buf.byteLength };
     }
     catch {
-        return undefined;
+        return;
     }
 }
-async function readDirMaybe(uri) {
+async function ensureParentDir(u) {
+    const dir = vscode.Uri.file(path.dirname(u.fsPath));
     try {
-        return await vscode.workspace.fs.readDirectory(uri);
+        await vscode.workspace.fs.stat(dir);
     }
     catch {
-        return [];
+        await vscode.workspace.fs.createDirectory(dir);
     }
 }
-/** Read bytes from any URI (file:, git:, untitled:). */
-async function readBytesFlexible(uriStr) {
-    if (!uriStr)
-        return undefined;
-    let uri;
+async function writeWorkspaceFile(repoRoot, rel, content) {
+    const target = vscode.Uri.file(path.join(repoRoot, rel));
+    await ensureParentDir(target);
+    await vscode.workspace.fs.writeFile(target, Buffer.from(content, 'utf8'));
+}
+async function deleteWorkspaceFile(repoRoot, rel) {
+    const target = vscode.Uri.file(path.join(repoRoot, rel));
     try {
-        uri = vscode.Uri.parse(uriStr);
+        await vscode.workspace.fs.delete(target, { useTrash: true });
     }
-    catch {
-        return undefined;
-    }
-    // Try FS API first
-    try {
-        return await vscode.workspace.fs.readFile(uri);
-    }
-    catch {
-        // Fallback: open as text doc and convert to bytes
-        try {
-            const doc = await vscode.workspace.openTextDocument(uri);
-            return Buffer.from(doc.getText(), 'utf8');
-        }
-        catch {
-            return undefined;
-        }
-    }
+    catch { }
 }
 async function activate(context) {
     const store = new store_1.Store(context);
-    // Track edits while a checkpoint is active
+    // Track edits between checkpoint and logPrompt
     const editListener = vscode.workspace.onDidChangeTextDocument((e) => {
         if (!store.session.lastCheckpointSha)
             return;
@@ -79,7 +70,6 @@ async function activate(context) {
             touchedSinceCheckpoint.add(rp);
     });
     context.subscriptions.push(editListener);
-    // Commands
     const startSession = vscode.commands.registerCommand('promptReplay.startSession', async () => {
         const ws = vscode.workspace.workspaceFolders?.[0];
         if (!ws) {
@@ -94,25 +84,20 @@ async function activate(context) {
         const api = await (0, git_1.getGitApi)();
         const repo = (0, git_1.primaryRepo)(api);
         const sha = (0, git_1.headSha)(repo) ?? `:working:${Date.now()}`;
-        if (!store.session.active) {
+        if (!store.session.active)
             await vscode.commands.executeCommand('promptReplay.startSession');
-        }
         store.session = { ...store.session, lastCheckpointSha: sha };
         touchedSinceCheckpoint.clear();
         vscode.window.showInformationMessage(`Prompt Replay: checkpoint created (${sha.slice(0, 8)})`);
     });
     const logPrompt = vscode.commands.registerCommand('promptReplay.logPrompt', async () => {
-        const prompt = await vscode.window.showInputBox({
-            prompt: 'Enter the AI prompt you used',
-            validateInput: v => (v ? undefined : 'Prompt required')
-        });
+        const prompt = await vscode.window.showInputBox({ prompt: 'Enter the AI prompt you used', validateInput: v => (v ? undefined : 'Prompt required') });
         if (!prompt)
             return;
         const responsePreview = await vscode.window.showInputBox({ prompt: 'Optional: short response preview (or leave empty)' });
         const tagsStr = await vscode.window.showInputBox({ prompt: 'Optional: tags (comma-separated, e.g. bug fix, refactor)' });
         const tags = tagsStr ? tagsStr.split(',').map(s => s.trim()).filter(Boolean) : undefined;
-        const cfg = vscode.workspace.getConfiguration('promptReplay');
-        const maxEvents = cfg.get('maxEvents', 2000);
+        const maxEvents = vscode.workspace.getConfiguration('promptReplay').get('maxEvents', 2000);
         const api = await (0, git_1.getGitApi)();
         const repo = (0, git_1.primaryRepo)(api);
         let diffs = await (0, git_1.collectWorkingDiff)(repo);
@@ -148,70 +133,55 @@ async function activate(context) {
             diffUris: [],
             tags
         };
-        // snapshot directories
         const snapshotsDir = vscode.Uri.file(path.join(repoRoot, '.promptreplay', 'snapshots', ev.id));
         try {
             await vscode.workspace.fs.createDirectory(snapshotsDir);
         }
         catch { }
-        const beforeDir = vscode.Uri.file(path.join(snapshotsDir.fsPath, '__before__'));
         const afterDir = vscode.Uri.file(path.join(snapshotsDir.fsPath, '__after__'));
-        try {
-            await vscode.workspace.fs.createDirectory(beforeDir);
-        }
-        catch { }
         try {
             await vscode.workspace.fs.createDirectory(afterDir);
         }
         catch { }
-        const leftSnapUris = {};
-        const rightSnapUris = {};
-        const ops = {};
-        for (const d of diffs) {
-            const rel = d.path.replace(/\\/g, '/');
-            // left (before)
-            const leftText = checkpointRef ? await (0, git_1.getFileAtRef)(repoRoot, checkpointRef, rel) : undefined;
-            const leftSnap = vscode.Uri.file(path.join(beforeDir.fsPath, rel));
-            try {
-                await vscode.workspace.fs.createDirectory(vscode.Uri.file(path.dirname(leftSnap.fsPath)));
+        const snapshotLeftUris = {};
+        const snapshotRightUrisForDeleted = {};
+        if (checkpointRef) {
+            for (const d of diffs) {
+                try {
+                    const leftText = await (0, git_1.getFileAtRef)(repoRoot, checkpointRef, d.path);
+                    const leftSnap = vscode.Uri.file(path.join(snapshotsDir.fsPath, d.path));
+                    const leftDirUri = vscode.Uri.file(path.dirname(leftSnap.fsPath));
+                    try {
+                        await vscode.workspace.fs.createDirectory(leftDirUri);
+                    }
+                    catch { }
+                    if (leftText !== undefined) {
+                        await vscode.workspace.fs.writeFile(leftSnap, Buffer.from(leftText, 'utf8'));
+                    }
+                    else {
+                        await vscode.workspace.fs.writeFile(leftSnap, Buffer.alloc(0)); // new file then
+                    }
+                    snapshotLeftUris[d.path] = leftSnap;
+                    const rightExists = await exists(d.right);
+                    if (!rightExists) {
+                        const rightSnap = vscode.Uri.file(path.join(afterDir.fsPath, d.path));
+                        const rightDirUri = vscode.Uri.file(path.dirname(rightSnap.fsPath));
+                        try {
+                            await vscode.workspace.fs.createDirectory(rightDirUri);
+                        }
+                        catch { }
+                        await vscode.workspace.fs.writeFile(rightSnap, Buffer.alloc(0)); // deleted in after
+                        snapshotRightUrisForDeleted[d.path] = rightSnap;
+                    }
+                }
+                catch { }
             }
-            catch { }
-            if (leftText !== undefined) {
-                await vscode.workspace.fs.writeFile(leftSnap, Buffer.from(leftText, 'utf8'));
-            }
-            else {
-                // represent "no file" as empty; we'll rely on `op` to distinguish
-                await vscode.workspace.fs.writeFile(leftSnap, Buffer.alloc(0));
-            }
-            leftSnapUris[rel] = leftSnap;
-            // right (after)
-            const target = vscode.Uri.file(path.join(repoRoot, rel));
-            const rightSnap = vscode.Uri.file(path.join(afterDir.fsPath, rel));
-            try {
-                await vscode.workspace.fs.createDirectory(vscode.Uri.file(path.dirname(rightSnap.fsPath)));
-            }
-            catch { }
-            const targetExists = await exists(target);
-            if (targetExists) {
-                const buf = await vscode.workspace.fs.readFile(target);
-                await vscode.workspace.fs.writeFile(rightSnap, buf);
-                ops[rel] = leftText === undefined ? 'added' : 'modified';
-            }
-            else {
-                await vscode.workspace.fs.writeFile(rightSnap, Buffer.alloc(0));
-                ops[rel] = 'deleted';
-            }
-            rightSnapUris[rel] = rightSnap;
         }
-        ev.diffUris = diffs.map(d => {
-            const rel = d.path.replace(/\\/g, '/');
-            return {
-                path: rel,
-                left: leftSnapUris[rel]?.toString(),
-                right: rightSnapUris[rel]?.toString(),
-                op: ops[rel]
-            };
-        });
+        ev.diffUris = diffs.map(d => ({
+            path: d.path,
+            left: (snapshotLeftUris[d.path] ?? d.left)?.toString(),
+            right: (snapshotRightUrisForDeleted[d.path] ?? d.right)?.toString()
+        }));
         await store.appendEvent(ev, maxEvents);
         touchedSinceCheckpoint.clear();
         store.session = { ...store.session, lastCheckpointSha: undefined };
@@ -219,69 +189,147 @@ async function activate(context) {
     });
     const openTimeline = vscode.commands.registerCommand('promptReplay.openTimeline', async () => {
         const panel = timelinePanel_1.TimelinePanel.createOrShow(context);
-        let eventsAll = await store.readEvents();
-        panel.setEvents(eventsAll);
-        panel.onMessage(async (message) => {
-            try {
-                if (message.type === 'openDiff') {
-                    const left = message.left ? vscode.Uri.parse(message.left) : undefined;
-                    const right = message.right ? vscode.Uri.parse(message.right) : undefined;
-                    if (left && right) {
-                        vscode.commands.executeCommand('vscode.diff', left, right, message.title || 'Diff');
-                    }
-                    else if (right) {
-                        vscode.window.showTextDocument(right);
-                    }
-                    else if (left) {
-                        vscode.window.showTextDocument(left);
-                    }
-                    else {
-                        vscode.window.showWarningMessage('No diff to open for this item.');
-                    }
-                    return;
-                }
-                if (message.type === 'search') {
-                    const q = (message.q || '').toLowerCase().trim();
-                    eventsAll = await store.readEvents();
-                    const filtered = !q ? eventsAll : eventsAll.filter(ev => ev.prompt.toLowerCase().includes(q) ||
-                        ev.filesChanged.some(f => f.toLowerCase().includes(q)) ||
-                        (ev.tags ?? []).some(t => t.toLowerCase().includes(q)));
-                    timelinePanel_1.TimelinePanel.current?.setEvents(filtered);
-                    return;
-                }
-                if (message.type === 'exportEvent') {
-                    await exportEventMarkdown(String(message.id || ''), store);
-                    return;
-                }
-                if (message.type === 'restoreEvent') {
-                    // side: 'before' | 'after' (default 'after')
-                    await handleRestoreEvent({ ...message }, store);
-                    return;
-                }
-                if (message.type === 'restoreFile') {
-                    await handleRestoreFile({ ...message }, store);
-                    return;
-                }
-                if (message.type === 'deleteEvent') {
-                    await deleteEventAndAssets(String(message.id || ''), store);
-                    const fresh = await store.readEvents();
-                    timelinePanel_1.TimelinePanel.current?.setEvents(fresh);
-                    return;
-                }
-                if (message.type === 'openTrash') {
-                    await restoreDeletedEventViaUI(store);
-                    const fresh = await store.readEvents();
-                    timelinePanel_1.TimelinePanel.current?.setEvents(fresh);
-                    return;
-                }
+        let mode = 'active';
+        async function refresh() {
+            const all = await store.readEvents();
+            const trash = await store.readTrashIds();
+            const sums = await store.readAllSummaries();
+            const filtered = mode === 'trash'
+                ? all.filter(ev => trash.has(ev.id))
+                : all.filter(ev => !trash.has(ev.id));
+            // pass the trash set so the panel knows which buttons to show
+            panel.setEvents(filtered, sums, trash);
+        }
+        await refresh();
+        panel.onMessage(async (msg) => {
+            if (msg.type === 'openDiff') {
+                const left = msg.left ? vscode.Uri.parse(msg.left) : undefined;
+                const right = msg.right ? vscode.Uri.parse(msg.right) : undefined;
+                if (left && right)
+                    vscode.commands.executeCommand('vscode.diff', left, right, msg.title || 'Diff');
+                else if (right)
+                    vscode.window.showTextDocument(right);
+                return;
             }
-            catch (e) {
-                console.error('[Prompt Replay] onMessage error:', e);
-                vscode.window.showErrorMessage('Prompt Replay: action failed (see Debug Console).');
+            if (msg.type === 'search') {
+                // Extension filters on text, mode preserved
+                const q = (msg.q || '').toLowerCase();
+                const all = await store.readEvents();
+                const trash = await store.readTrashIds();
+                const sums = await store.readAllSummaries();
+                const base = mode === 'trash'
+                    ? all.filter(ev => trash.has(ev.id))
+                    : all.filter(ev => !trash.has(ev.id));
+                const filtered = !q ? base : base.filter(ev => ev.prompt.toLowerCase().includes(q) ||
+                    ev.filesChanged.some(f => f.toLowerCase().includes(q)) ||
+                    (ev.tags ?? []).some(t => t.toLowerCase().includes(q)));
+                panel.setEvents(filtered, sums, trash);
+                return;
+            }
+            if (msg.type === 'summarize' && msg.eventId) {
+                const ev = (await store.readEvents()).find(e => e.id === msg.eventId);
+                if (!ev) {
+                    vscode.window.showWarningMessage('Event not found.');
+                    return;
+                }
+                const perFile = [];
+                for (const d of ev.diffUris || []) {
+                    const leftUri = d.left ? vscode.Uri.parse(d.left) : undefined;
+                    const rightUri = d.right ? vscode.Uri.parse(d.right) : undefined;
+                    const lt = await readUtf8(leftUri);
+                    const rt = await readUtf8(rightUri);
+                    perFile.push({ path: d.path, before: lt?.text, after: rt?.text });
+                }
+                await vscode.window.withProgress({ location: vscode.ProgressLocation.Notification, title: 'Prompt Replay: Summarizing diff…' }, async () => {
+                    const summary = await (0, ai_1.summarizeWithVsCodeLM)(ev, perFile);
+                    if (!summary) {
+                        vscode.window.showInformationMessage('No language model available in VS Code.');
+                        return;
+                    }
+                    await store.writeSummary(ev.id, summary);
+                });
+                await refresh();
+                return;
+            }
+            // ---- TRASH / UNTRASH / DELETE PERMANENT ----
+            if (msg.type === 'trashEvent' && msg.eventId) {
+                await store.trashEvent(msg.eventId);
+                await refresh();
+                return;
+            }
+            if (msg.type === 'restoreFromTrash' && msg.eventId) {
+                await store.untrashEvent(msg.eventId);
+                await refresh();
+                return;
+            }
+            if (msg.type === 'deletePermanent' && msg.eventId) {
+                const ok = await vscode.window.showWarningMessage('Delete permanently? This removes the event, snapshots, summary, and exports (cannot be undone).', { modal: true }, 'Delete');
+                if (ok === 'Delete') {
+                    await store.deleteEventPermanent(msg.eventId);
+                    await refresh();
+                }
+                return;
+            }
+            if (msg.type === 'switchMode' && (msg.mode === 'active' || msg.mode === 'trash')) {
+                mode = msg.mode;
+                await refresh();
+                return;
+            }
+            // ---- RESTORE FILE / ALL ----
+            if ((msg.type === 'restoreFile' || msg.type === 'restoreAll') && msg.eventId) {
+                const ev = (await store.readEvents()).find(e => e.id === msg.eventId);
+                if (!ev) {
+                    vscode.window.showWarningMessage('Event not found.');
+                    return;
+                }
+                const repoRoot = ev.repoRoot || (vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? '');
+                const side = msg.side === 'after' ? 'after' : 'before';
+                const targets = msg.type === 'restoreFile'
+                    ? (ev.diffUris || []).filter(d => d.path === msg.path)
+                    : (ev.diffUris || []);
+                if (!targets.length) {
+                    vscode.window.showInformationMessage('No matching files to restore.');
+                    return;
+                }
+                const title = msg.type === 'restoreFile'
+                    ? `Restoring ${side} for ${msg.path}`
+                    : `Restoring ${side} for ${targets.length} file(s)`;
+                await vscode.window.withProgress({ location: vscode.ProgressLocation.Notification, title }, async () => {
+                    for (const d of targets) {
+                        const leftUri = d.left ? vscode.Uri.parse(d.left) : undefined;
+                        const rightUri = d.right ? vscode.Uri.parse(d.right) : undefined;
+                        const targetRel = d.path;
+                        if (side === 'before') {
+                            const left = await readUtf8(leftUri);
+                            if (!left)
+                                continue;
+                            if ((left.size === 0) && ev.beforeRef) {
+                                await deleteWorkspaceFile(repoRoot, targetRel);
+                            }
+                            else {
+                                await writeWorkspaceFile(repoRoot, targetRel, left.text);
+                            }
+                        }
+                        else {
+                            const right = await readUtf8(rightUri);
+                            if (!right)
+                                continue;
+                            const isSyntheticAfter = !!rightUri?.fsPath && rightUri.fsPath.includes(`${path.sep}__after__${path.sep}`);
+                            if (isSyntheticAfter && right.size === 0) {
+                                await deleteWorkspaceFile(repoRoot, targetRel);
+                            }
+                            else {
+                                await writeWorkspaceFile(repoRoot, targetRel, right.text);
+                            }
+                        }
+                    }
+                });
+                vscode.window.showInformationMessage('Restore complete.');
+                return;
             }
         });
     });
-    // Optional: nudge
+    // Optional nudge for large edits
     const nudges = vscode.workspace.getConfiguration('promptReplay').get('autoNudgeLargeEdit', true);
     const lineThreshold = vscode.workspace.getConfiguration('promptReplay').get('largeEditLineThreshold', 20);
     let changeAccumulator = 0;
@@ -297,624 +345,4 @@ async function activate(context) {
     context.subscriptions.push(startSession, createCheckpoint, logPrompt, openTimeline, changeSub);
 }
 function deactivate() { }
-/* ---------------- Export to Markdown ---------------- */
-async function exportEventMarkdown(id, store) {
-    if (!id) {
-        vscode.window.showWarningMessage('Export failed: missing event id.');
-        return;
-    }
-    const events = await store.readEvents();
-    const ev = events.find(e => e.id === id);
-    if (!ev) {
-        vscode.window.showWarningMessage('Export failed: event not found.');
-        return;
-    }
-    const root = ev.repoRoot || vscode.workspace.workspaceFolders?.[0]?.uri.fsPath || '';
-    if (!root) {
-        vscode.window.showWarningMessage('Export failed: workspace root not found.');
-        return;
-    }
-    const snapsDir = path.join(root, '.promptreplay', 'snapshots', id);
-    const beforeDir = path.join(snapsDir, '__before__');
-    const afterDir = path.join(snapsDir, '__after__');
-    const when = new Date(ev.timestamp || Date.now());
-    const dateStr = `${when.toLocaleDateString()} ${when.toLocaleTimeString()}`;
-    const header = [
-        `# Prompt Replay — Event ${id} (${dateStr})`,
-        ``,
-        `**Prompt:** ${codeQuote(ev.prompt || '')}`,
-        ev.tags?.length ? `**Tags:** ${ev.tags.join(', ')}` : ``,
-        `**Repo:** ${root}`,
-        `**Before:** ${ev.beforeRef ? truncateSha(ev.beforeRef) : '—'}  |  **After:** working tree at log time`,
-        ``,
-        `---`,
-        ``,
-    ].filter(Boolean).join('\n');
-    let filesList = [];
-    let fileSections = [];
-    for (const d of ev.diffUris || []) {
-        const rel = d.path;
-        const leftText = await readUtf8Maybe(vscode.Uri.file(path.join(beforeDir, rel)));
-        const rightText = await readUtf8Maybe(vscode.Uri.file(path.join(afterDir, rel)));
-        const diff = buildUnifiedDiff(leftText, rightText);
-        const counts = countDiff(diff);
-        const status = d.op === 'added' ? 'Added' : d.op === 'deleted' ? 'Deleted' : 'Modified';
-        filesList.push(`- **${rel}** — ${status} (+${counts.added} / −${counts.removed})`);
-        const section = [
-            ``,
-            `### ${rel} (${status})`,
-            '```diff',
-            ...diff,
-            '```',
-            ``
-        ].join('\n');
-        fileSections.push(section);
-    }
-    const listBlock = [`## Files changed (${filesList.length})`, ...filesList, ``, `---`, ``].join('\n');
-    if (ev.responsePreview) {
-        fileSections.unshift(`**Response preview:**\n\n> ${ev.responsePreview}\n\n`);
-    }
-    const md = [header, listBlock, ...fileSections].join('\n');
-    const exportsDir = vscode.Uri.file(path.join(root, '.promptreplay', 'exports'));
-    try {
-        await vscode.workspace.fs.createDirectory(exportsDir);
-    }
-    catch { }
-    const outUri = vscode.Uri.file(path.join(exportsDir.fsPath, `event-${id}.md`));
-    await vscode.workspace.fs.writeFile(outUri, Buffer.from(md, 'utf8'));
-    const doc = await vscode.workspace.openTextDocument(outUri);
-    await vscode.window.showTextDocument(doc, { preview: false });
-    vscode.window.showInformationMessage(`Prompt Replay: exported to ${outUri.fsPath}`);
-}
-/* ---------------- Delete event + assets ---------------- */
-async function deleteEventAndAssets(id, store) {
-    if (!id) {
-        vscode.window.showWarningMessage('Delete failed: missing event id.');
-        return;
-    }
-    const events = await store.readEvents();
-    const ev = events.find(e => e.id === id);
-    if (!ev) {
-        vscode.window.showWarningMessage('Delete failed: event not found.');
-        return;
-    }
-    const root = ev.repoRoot || vscode.workspace.workspaceFolders?.[0]?.uri.fsPath || '';
-    if (!root) {
-        vscode.window.showWarningMessage('Delete failed: workspace root not found.');
-        return;
-    }
-    const ok = await vscode.window.showWarningMessage('Delete this prompt event? Snapshots and exports will be moved to .promptreplay/trash.', { modal: true }, 'Delete');
-    if (ok !== 'Delete')
-        return;
-    const prDir = path.join(root, '.promptreplay');
-    const eventsUri = vscode.Uri.file(path.join(prDir, 'events.jsonl'));
-    const snapsDir = vscode.Uri.file(path.join(prDir, 'snapshots', id));
-    const exportMd = vscode.Uri.file(path.join(prDir, 'exports', `event-${id}.md`));
-    const trashBase = vscode.Uri.file(path.join(prDir, 'trash'));
-    try {
-        await vscode.workspace.fs.createDirectory(trashBase);
-    }
-    catch { }
-    const stamp = Date.now();
-    const trashEventDir = vscode.Uri.file(path.join(trashBase.fsPath, `${stamp}-${id}`));
-    try {
-        await vscode.workspace.fs.createDirectory(trashEventDir);
-    }
-    catch { }
-    if (await exists(snapsDir)) {
-        const dest = vscode.Uri.file(path.join(trashEventDir.fsPath, 'snapshots'));
-        try {
-            await vscode.workspace.fs.rename(snapsDir, dest, { overwrite: false });
-        }
-        catch { }
-    }
-    if (await exists(exportMd)) {
-        const dest = vscode.Uri.file(path.join(trashEventDir.fsPath, `event-${id}.md`));
-        try {
-            await vscode.workspace.fs.rename(exportMd, dest, { overwrite: true });
-        }
-        catch { }
-    }
-    try {
-        const buf = await vscode.workspace.fs.readFile(eventsUri);
-        const original = Buffer.from(buf);
-        const backupUri = vscode.Uri.file(path.join(trashEventDir.fsPath, 'events.jsonl.bak'));
-        await vscode.workspace.fs.writeFile(backupUri, original);
-        const lines = original.toString('utf8').split('\n').filter(Boolean);
-        const kept = [];
-        let removed = 0;
-        for (const line of lines) {
-            try {
-                const obj = JSON.parse(line);
-                if (obj && obj.id === id) {
-                    removed++;
-                    continue;
-                }
-            }
-            catch { }
-            kept.push(line);
-        }
-        await vscode.workspace.fs.writeFile(eventsUri, Buffer.from(kept.join('\n') + (kept.length ? '\n' : ''), 'utf8'));
-        const evJsonUri = vscode.Uri.file(path.join(trashEventDir.fsPath, `event-${id}.json`));
-        await vscode.workspace.fs.writeFile(evJsonUri, Buffer.from(JSON.stringify(ev, null, 2), 'utf8'));
-        vscode.window.showInformationMessage(removed ? `Prompt Replay: deleted event ${id}. Assets moved to .promptreplay/trash/${stamp}-${id}/`
-            : `Prompt Replay: event ${id} not found in events.jsonl (already removed?).`);
-    }
-    catch (err) {
-        console.error('[Prompt Replay] deleteEvent error:', err);
-        vscode.window.showErrorMessage('Prompt Replay: failed to delete event (see Debug Console).');
-    }
-}
-/* ---------------- Restore from Trash ---------------- */
-async function restoreDeletedEventViaUI(store) {
-    const root = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath || '';
-    if (!root) {
-        vscode.window.showWarningMessage('Open a folder/workspace first.');
-        return;
-    }
-    const prDir = path.join(root, '.promptreplay');
-    const trashDir = vscode.Uri.file(path.join(prDir, 'trash'));
-    if (!(await exists(trashDir))) {
-        vscode.window.showInformationMessage('Prompt Replay: trash is empty.');
-        return;
-    }
-    const entries = await readDirMaybe(trashDir);
-    const candidates = [];
-    for (const entry of entries) {
-        const name = entry[0];
-        const kind = entry[1];
-        if (kind !== vscode.FileType.Directory)
-            continue;
-        const dir = vscode.Uri.file(path.join(trashDir.fsPath, name));
-        const inner = await readDirMaybe(dir);
-        const meta = inner.find((ent) => ent[0].startsWith('event-') && ent[0].endsWith('.json'));
-        if (!meta)
-            continue;
-        const id = meta[0].slice('event-'.length, -'.json'.length);
-        const jsonUri = vscode.Uri.file(path.join(dir.fsPath, meta[0]));
-        let prompt = '';
-        let timestamp = '';
-        try {
-            const raw = await vscode.workspace.fs.readFile(jsonUri);
-            const obj = JSON.parse(Buffer.from(raw).toString('utf8'));
-            prompt = (obj.prompt || '').toString();
-            timestamp = new Date(obj.timestamp || Date.now()).toLocaleString();
-        }
-        catch { }
-        candidates.push({
-            label: prompt ? (prompt.length > 90 ? prompt.slice(0, 87) + '…' : prompt) : `(no prompt)`,
-            description: `id: ${id} • ${timestamp}`,
-            detail: `Trash folder: ${name}`,
-            dir,
-            id
-        });
-    }
-    if (candidates.length === 0) {
-        vscode.window.showInformationMessage('Prompt Replay: no deleted events found in trash.');
-        return;
-    }
-    const picked = await vscode.window.showQuickPick(candidates, {
-        placeHolder: 'Select a deleted event to restore…',
-        matchOnDetail: true,
-        matchOnDescription: true
-    });
-    if (!picked)
-        return;
-    await restoreDeletedEventFromDir(picked.dir, picked.id, store);
-}
-async function restoreDeletedEventFromDir(trashEventDir, id, store) {
-    const root = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath || '';
-    if (!root) {
-        vscode.window.showWarningMessage('Workspace root not found.');
-        return;
-    }
-    const prDir = path.join(root, '.promptreplay');
-    const jsonUri = vscode.Uri.file(path.join(trashEventDir.fsPath, `event-${id}.json`));
-    let ev;
-    try {
-        const raw = await vscode.workspace.fs.readFile(jsonUri);
-        ev = JSON.parse(Buffer.from(raw).toString('utf8'));
-    }
-    catch {
-        vscode.window.showErrorMessage('Prompt Replay: could not read trashed event JSON.');
-        return;
-    }
-    if (!ev)
-        return;
-    const existing = (await store.readEvents()).some(e => e.id === id);
-    if (!existing) {
-        const maxEvents = vscode.workspace.getConfiguration('promptReplay').get('maxEvents', 2000);
-        await store.appendEvent(ev, maxEvents);
-    }
-    const srcSnaps = vscode.Uri.file(path.join(trashEventDir.fsPath, 'snapshots'));
-    const dstSnaps = vscode.Uri.file(path.join(prDir, 'snapshots', id));
-    try {
-        await vscode.workspace.fs.createDirectory(vscode.Uri.file(path.join(prDir, 'snapshots')));
-        if (await exists(srcSnaps)) {
-            await vscode.workspace.fs.rename(srcSnaps, dstSnaps, { overwrite: true });
-        }
-    }
-    catch { }
-    const srcMd = vscode.Uri.file(path.join(trashEventDir.fsPath, `event-${id}.md`));
-    const dstMd = vscode.Uri.file(path.join(prDir, 'exports', `event-${id}.md`));
-    try {
-        await vscode.workspace.fs.createDirectory(vscode.Uri.file(path.join(prDir, 'exports')));
-        if (await exists(srcMd)) {
-            await vscode.workspace.fs.rename(srcMd, dstMd, { overwrite: true });
-        }
-    }
-    catch { }
-    vscode.window.showInformationMessage(`Prompt Replay: restored event ${id} from trash.`);
-}
-/* ---------------- Small helpers for export/diff ---------------- */
-function codeQuote(s) {
-    const cleaned = (s || '').replace(/\r/g, '');
-    if (cleaned.includes('\n'))
-        return `\n\n> ${cleaned.split('\n').join('\n> ')}\n`;
-    return `“${cleaned}”`;
-}
-function truncateSha(ref) {
-    if (!ref)
-        return '—';
-    if (ref.startsWith(':working:'))
-        return 'working';
-    return ref.length > 8 ? ref.slice(0, 8) : ref;
-}
-async function readUtf8Maybe(uri) {
-    try {
-        const buf = await vscode.workspace.fs.readFile(uri);
-        return Buffer.from(buf).toString('utf8');
-    }
-    catch {
-        return '';
-    }
-}
-function buildUnifiedDiff(before, after) {
-    const A = (before ?? '').split('\n');
-    const B = (after ?? '').split('\n');
-    const n = A.length, m = B.length;
-    const dp = Array.from({ length: n + 1 }, () => Array(m + 1).fill(0));
-    for (let i = n - 1; i >= 0; i--)
-        for (let j = m - 1; j >= 0; j--)
-            dp[i][j] = A[i] === B[j] ? dp[i + 1][j + 1] + 1 : Math.max(dp[i + 1][j], dp[i][j + 1]);
-    const ops = [];
-    let i = 0, j = 0;
-    while (i < n && j < m) {
-        if (A[i] === B[j]) {
-            ops.push({ t: ' ', s: A[i++] });
-            j++;
-        }
-        else if (dp[i + 1][j] >= dp[i][j + 1])
-            ops.push({ t: '-', s: A[i++] });
-        else
-            ops.push({ t: '+', s: B[j++] });
-    }
-    while (i < n)
-        ops.push({ t: '-', s: A[i++] });
-    while (j < m)
-        ops.push({ t: '+', s: B[j++] });
-    const context = 3, out = [];
-    let k = 0;
-    while (k < ops.length) {
-        if (ops[k].t !== ' ') {
-            let start = k;
-            while (start > 0 && ops[start - 1].t === ' ' && (k - (start - 1)) <= context)
-                start--;
-            let end = k;
-            while (end < ops.length && ops[end].t !== ' ')
-                end++;
-            let tail = end;
-            while (tail < ops.length && ops[tail].t === ' ' && (tail - end) <= context)
-                tail++;
-            for (let x = start; x < tail; x++)
-                out.push((ops[x].t === ' ' ? ' ' : ops[x].t) + ops[x].s);
-            if (tail < ops.length)
-                out.push('...');
-            k = tail;
-        }
-        else
-            k++;
-    }
-    if (out.length === 0 && A.length === B.length && A.every((v, idx) => v === B[idx]))
-        return [' (no changes) '];
-    return out;
-}
-function countDiff(lines) {
-    let added = 0, removed = 0;
-    for (const l of lines) {
-        if (l.startsWith('+'))
-            added++;
-        else if (l.startsWith('-'))
-            removed++;
-    }
-    return { added, removed };
-}
-/* ---------------- Restore helpers (supports before/after) ---------------- */
-async function handleRestoreEvent(message, store) {
-    const id = String(message.id || '');
-    const side = (message.side === 'before' || message.side === 'after') ? message.side : 'after';
-    if (!id) {
-        vscode.window.showWarningMessage('Missing event id.');
-        return;
-    }
-    const all = await store.readEvents();
-    const ev = all.find(e => e.id === id);
-    if (!ev) {
-        vscode.window.showWarningMessage('Event not found.');
-        return;
-    }
-    const confirm = await vscode.window.showWarningMessage(`Restore ${ev.filesChanged.length} file(s) to the ${side.toUpperCase()} snapshot of this event? This will overwrite your working copies.`, { modal: true }, 'Restore');
-    if (confirm !== 'Restore')
-        return;
-    const root = ev.repoRoot || vscode.workspace.workspaceFolders?.[0]?.uri.fsPath || '';
-    if (!root) {
-        vscode.window.showWarningMessage('Workspace root not found.');
-        return;
-    }
-    const backupId = `backup-${Date.now()}`;
-    const backupDir = vscode.Uri.file(path.join(root, '.promptreplay', 'restore_backups', backupId));
-    const backupBeforeDir = vscode.Uri.file(path.join(backupDir.fsPath, 'before'));
-    try {
-        await vscode.workspace.fs.createDirectory(backupBeforeDir);
-    }
-    catch { }
-    const manifest = [];
-    for (const d of ev.diffUris || []) {
-        const rel = d.path;
-        const target = vscode.Uri.file(path.join(root, rel));
-        const entry = { path: rel, existed: false };
-        const st = await statMaybe(target);
-        if (st) {
-            entry.existed = true;
-            const backupTarget = vscode.Uri.file(path.join(backupBeforeDir.fsPath, rel));
-            try {
-                await vscode.workspace.fs.createDirectory(vscode.Uri.file(path.dirname(backupTarget.fsPath)));
-            }
-            catch { }
-            const buf = await vscode.workspace.fs.readFile(target);
-            await vscode.workspace.fs.writeFile(backupTarget, buf);
-        }
-        manifest.push(entry);
-    }
-    const manifestUri = vscode.Uri.file(path.join(backupDir.fsPath, 'manifest.json'));
-    await vscode.workspace.fs.writeFile(manifestUri, Buffer.from(JSON.stringify(manifest, null, 2), 'utf8'));
-    let restored = 0, deleted = 0, skipped = 0, errors = 0;
-    for (const d of ev.diffUris || []) {
-        const rel = d.path;
-        const target = vscode.Uri.file(path.join(root, rel));
-        const op = d.op;
-        try {
-            if (side === 'after') {
-                // After: if op === deleted, remove file; else write from right
-                if (op === 'deleted') {
-                    try {
-                        await vscode.workspace.fs.delete(target, { recursive: false, useTrash: false });
-                        deleted++;
-                    }
-                    catch {
-                        skipped++;
-                    }
-                }
-                else {
-                    const bytes = await readBytesFlexible(d.right);
-                    if (bytes === undefined) {
-                        skipped++;
-                    }
-                    else {
-                        try {
-                            await vscode.workspace.fs.createDirectory(vscode.Uri.file(path.dirname(target.fsPath)));
-                        }
-                        catch { }
-                        await vscode.workspace.fs.writeFile(target, bytes);
-                        restored++;
-                    }
-                }
-            }
-            else { // before
-                // Before: if op === added, remove file; else write from left
-                if (op === 'added') {
-                    try {
-                        await vscode.workspace.fs.delete(target, { recursive: false, useTrash: false });
-                        deleted++;
-                    }
-                    catch {
-                        skipped++;
-                    }
-                }
-                else {
-                    const bytes = await readBytesFlexible(d.left);
-                    if (bytes === undefined) {
-                        skipped++;
-                    }
-                    else {
-                        try {
-                            await vscode.workspace.fs.createDirectory(vscode.Uri.file(path.dirname(target.fsPath)));
-                        }
-                        catch { }
-                        await vscode.workspace.fs.writeFile(target, bytes);
-                        restored++;
-                    }
-                }
-            }
-        }
-        catch {
-            errors++;
-        }
-    }
-    const undoAction = 'Undo';
-    const summary = `Prompt Replay: restore (${side}) — ${restored} restored, ${deleted} deleted, ${skipped} skipped${errors ? `, ${errors} errors` : ''}.`;
-    const choice = await vscode.window.showInformationMessage(summary, undoAction);
-    if (choice === 'Undo') {
-        let uRestored = 0, uDeleted = 0, uErrors = 0;
-        try {
-            const raw = await vscode.workspace.fs.readFile(manifestUri);
-            const manifestParsed = JSON.parse(Buffer.from(raw).toString('utf8'));
-            for (const entry of manifestParsed) {
-                const rel = entry.path;
-                const target = vscode.Uri.file(path.join(root, rel));
-                const backupFile = vscode.Uri.file(path.join(backupBeforeDir.fsPath, rel));
-                try {
-                    if (entry.existed) {
-                        const buf = await vscode.workspace.fs.readFile(backupFile);
-                        try {
-                            await vscode.workspace.fs.createDirectory(vscode.Uri.file(path.dirname(target.fsPath)));
-                        }
-                        catch { }
-                        await vscode.workspace.fs.writeFile(target, buf);
-                        uRestored++;
-                    }
-                    else {
-                        await vscode.workspace.fs.delete(target, { recursive: false, useTrash: false });
-                        uDeleted++;
-                    }
-                }
-                catch {
-                    uErrors++;
-                }
-            }
-            vscode.window.showInformationMessage(`Prompt Replay: undo complete — ${uRestored} restored, ${uDeleted} deleted${uErrors ? `, ${uErrors} errors` : ''}.`);
-        }
-        catch {
-            vscode.window.showErrorMessage('Prompt Replay: undo failed (could not read backup).');
-        }
-    }
-}
-async function handleRestoreFile(message, store) {
-    const id = String(message.id || '');
-    const rel = String(message.path || '');
-    const side = (message.side === 'before' || message.side === 'after') ? message.side : 'after';
-    if (!id || !rel) {
-        vscode.window.showWarningMessage('Missing event id or file path.');
-        return;
-    }
-    const all = await store.readEvents();
-    const ev = all.find(e => e.id === id);
-    if (!ev) {
-        vscode.window.showWarningMessage('Event not found.');
-        return;
-    }
-    const fileEntry = (ev.diffUris || []).find(d => d.path === rel);
-    if (!fileEntry) {
-        vscode.window.showWarningMessage('File not part of this event.');
-        return;
-    }
-    const confirm = await vscode.window.showWarningMessage(`Restore file “${rel}” to the ${side.toUpperCase()} snapshot of this event? This will overwrite your working copy.`, { modal: true }, 'Restore');
-    if (confirm !== 'Restore')
-        return;
-    const root = ev.repoRoot || vscode.workspace.workspaceFolders?.[0]?.uri.fsPath || '';
-    if (!root) {
-        vscode.window.showWarningMessage('Workspace root not found.');
-        return;
-    }
-    const backupId = `backup-${Date.now()}`;
-    const backupDir = vscode.Uri.file(path.join(root, '.promptreplay', 'restore_backups', backupId));
-    const backupBeforeDir = vscode.Uri.file(path.join(backupDir.fsPath, 'before'));
-    try {
-        await vscode.workspace.fs.createDirectory(backupBeforeDir);
-    }
-    catch { }
-    const entry = { path: rel, existed: false };
-    const target = vscode.Uri.file(path.join(root, rel));
-    const st = await statMaybe(target);
-    if (st) {
-        entry.existed = true;
-        const backupTarget = vscode.Uri.file(path.join(backupBeforeDir.fsPath, rel));
-        try {
-            await vscode.workspace.fs.createDirectory(vscode.Uri.file(path.dirname(backupTarget.fsPath)));
-        }
-        catch { }
-        const buf = await vscode.workspace.fs.readFile(target);
-        await vscode.workspace.fs.writeFile(backupTarget, buf);
-    }
-    const manifestUri = vscode.Uri.file(path.join(backupDir.fsPath, 'manifest.json'));
-    await vscode.workspace.fs.writeFile(manifestUri, Buffer.from(JSON.stringify([entry], null, 2), 'utf8'));
-    let didRestore = 0, didDelete = 0, skipped = 0, errors = 0;
-    try {
-        const op = fileEntry.op;
-        if (side === 'after') {
-            if (op === 'deleted') {
-                try {
-                    await vscode.workspace.fs.delete(target, { recursive: false, useTrash: false });
-                    didDelete++;
-                }
-                catch {
-                    skipped++;
-                }
-            }
-            else {
-                const bytes = await readBytesFlexible(fileEntry.right);
-                if (bytes === undefined) {
-                    skipped++;
-                }
-                else {
-                    try {
-                        await vscode.workspace.fs.createDirectory(vscode.Uri.file(path.dirname(target.fsPath)));
-                    }
-                    catch { }
-                    await vscode.workspace.fs.writeFile(target, bytes);
-                    didRestore++;
-                }
-            }
-        }
-        else {
-            if (op === 'added') {
-                try {
-                    await vscode.workspace.fs.delete(target, { recursive: false, useTrash: false });
-                    didDelete++;
-                }
-                catch {
-                    skipped++;
-                }
-            }
-            else {
-                const bytes = await readBytesFlexible(fileEntry.left);
-                if (bytes === undefined) {
-                    skipped++;
-                }
-                else {
-                    try {
-                        await vscode.workspace.fs.createDirectory(vscode.Uri.file(path.dirname(target.fsPath)));
-                    }
-                    catch { }
-                    await vscode.workspace.fs.writeFile(target, bytes);
-                    didRestore++;
-                }
-            }
-        }
-    }
-    catch {
-        errors++;
-    }
-    const undoAction = 'Undo';
-    const summary = `Prompt Replay: file restore (${side}) — ${didRestore ? 'restored' : didDelete ? 'deleted' : 'skipped'}${errors ? `, ${errors} errors` : ''}.`;
-    const choice = await vscode.window.showInformationMessage(summary, undoAction);
-    if (choice === 'Undo') {
-        try {
-            const raw = await vscode.workspace.fs.readFile(manifestUri);
-            const [back] = JSON.parse(Buffer.from(raw).toString('utf8'));
-            const targetUri = vscode.Uri.file(path.join(root, back.path));
-            try {
-                if (back.existed) {
-                    const backupFile = vscode.Uri.file(path.join(backupBeforeDir.fsPath, back.path));
-                    const buf = await vscode.workspace.fs.readFile(backupFile);
-                    try {
-                        await vscode.workspace.fs.createDirectory(vscode.Uri.file(path.dirname(targetUri.fsPath)));
-                    }
-                    catch { }
-                    await vscode.workspace.fs.writeFile(targetUri, buf);
-                }
-                else {
-                    await vscode.workspace.fs.delete(targetUri, { recursive: false, useTrash: false });
-                }
-                vscode.window.showInformationMessage('Prompt Replay: undo complete for file.');
-            }
-            catch {
-                vscode.window.showErrorMessage('Prompt Replay: undo failed for file.');
-            }
-        }
-        catch {
-            vscode.window.showErrorMessage('Prompt Replay: undo failed (could not read backup).');
-        }
-    }
-}
 //# sourceMappingURL=extension.js.map
